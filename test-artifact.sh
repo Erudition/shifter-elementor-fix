@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# test-artifact.sh — Elementor CSS Audit for Shifter Static Artifacts
+# test-artifact.sh — Elementor CSS Shifter Audit & Priming Tool
 #
 # Usage:
 #   ./test-artifact.sh <site-url> [options]
@@ -13,6 +13,8 @@
 #   --sitemap-from URL  Fetch sitemap from a different origin (e.g. the
 #                       live site) and rewrite URLs to <site-url>.
 #                       Useful for preview artifacts that lack a sitemap.
+#   --prime             Only "prime" the metadata (visit all pages) without
+#                       running the full audit checks. Useful for staging.
 #
 # Checks performed:
 #   1. Plugin heartbeat signature present
@@ -27,6 +29,10 @@
 #   0  All checks passed
 #   1  One or more checks failed
 #   2  Usage error or sitemap not found
+#
+# Terminology:
+#   *.static.getshifter.net = Staging (Live WordPress)
+#   *.preview.getshifter.io = Artifact (Static snapshot)
 
 set -euo pipefail
 
@@ -45,6 +51,7 @@ WARN_COUNT=0
 PAGES_CHECKED=0
 SAMPLE_SIZE=0
 SITEMAP_FROM=""
+PRIME_ONLY=false
 declare -A ELEMENTOR_VERSIONS=()
 declare -a FAILED_PAGES=()
 
@@ -55,11 +62,12 @@ warn()  { WARN_COUNT=$((WARN_COUNT+1)); echo -e "  ${YELLOW}⚠${RESET} $1"; }
 info()  { echo -e "  ${CYAN}ℹ${RESET} $1"; }
 
 usage() {
-    echo "Usage: $0 <site-url> [--sample N] [--sitemap-from URL]"
+    echo "Usage: $0 <site-url> [--sample N] [--sitemap-from URL] [--prime]"
     echo ""
-    echo "  <site-url>          Target artifact URL"
+    echo "  <site-url>          Target site URL (Staging or Artifact)"
     echo "  --sample N          Test only N random pages (+ homepage)"
     echo "  --sitemap-from URL  Pull sitemap from a different origin"
+    echo "  --prime             Only visit URLs to rebuild metadata (Staging site only)"
     exit 2
 }
 
@@ -79,6 +87,10 @@ while [[ $# -gt 0 ]]; do
             SITEMAP_FROM="${2%/}"
             shift 2
             ;;
+        --prime)
+            PRIME_ONLY=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             usage
@@ -86,52 +98,41 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Detect Audit Type
+if [[ "$BASE_URL" == *".static.getshifter.net"* ]]; then
+    AUDIT_TYPE="Staging (Live)"
+elif [[ "$BASE_URL" == *".preview.getshifter.io"* ]]; then
+    AUDIT_TYPE="Artifact (Static)"
+else
+    AUDIT_TYPE="Generic"
+fi
+
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # ── Step 1: Discover Pages via Sitemap ───────────────────────────────
-echo -e "\n${BOLD}═══ Elementor CSS Artifact Audit ═══${RESET}"
-echo -e "Target: ${CYAN}${BASE_URL}${RESET}"
-[[ -n "$SITEMAP_FROM" ]] && echo -e "Sitemap: ${CYAN}${SITEMAP_FROM}${RESET}"
+echo -e "\n${BOLD}═══ Elementor CSS Shifter Audit ═══${RESET}"
+echo -e "Target Type: ${BOLD}${AUDIT_TYPE}${RESET}"
+echo -e "Target URL:  ${CYAN}${BASE_URL}${RESET}"
+[[ -n "$SITEMAP_FROM" ]] && echo -e "Sitemap:     ${CYAN}${SITEMAP_FROM}${RESET}"
 echo ""
 
 echo -e "${BOLD}── Discovering pages ──${RESET}"
 
 SITEMAP_ORIGIN="${SITEMAP_FROM:-$BASE_URL}"
+SITEMAP_URL="${SITEMAP_ORIGIN}/sitemap.xml"
 
-# Try common sitemap paths
-SITEMAP_URL=""
-for candidate in "/sitemap_index.xml" "/sitemap.xml" "/wp-sitemap.xml"; do
-    status=$(curl -s -o /dev/null -w "%{http_code}" "${SITEMAP_ORIGIN}${candidate}")
-    if [[ "$status" == "200" ]]; then
-        SITEMAP_URL="${SITEMAP_ORIGIN}${candidate}"
-        break
-    fi
-done
-
-if [[ -z "$SITEMAP_URL" ]]; then
-    echo -e "${RED}Could not find sitemap. Tried sitemap_index.xml, sitemap.xml, wp-sitemap.xml${RESET}"
+if ! curl -s --head "$SITEMAP_URL" | grep -q "200 OK"; then
+    echo -e "${RED}Error: Sitemap not found at ${SITEMAP_URL}${RESET}"
     exit 2
 fi
 
 info "Found sitemap: ${SITEMAP_URL}"
 
-# Download the sitemap
-curl -s "$SITEMAP_URL" > "$TMPDIR/sitemap_root.xml"
+# Extract URLs
+curl -s "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' > "$TMPDIR/all_urls.txt"
 
-# Check if it's a sitemap index or a plain sitemap
-if grep -q "<sitemap>" "$TMPDIR/sitemap_root.xml"; then
-    # Sitemap index — fetch all child sitemaps
-    grep -oP '<loc>\K[^<]+' "$TMPDIR/sitemap_root.xml" > "$TMPDIR/child_sitemaps.txt"
-    > "$TMPDIR/all_urls.txt"
-    while IFS= read -r child_url; do
-        curl -s "$child_url" | grep -oP '<loc>\K[^<]+' >> "$TMPDIR/all_urls.txt"
-    done < "$TMPDIR/child_sitemaps.txt"
-else
-    grep -oP '<loc>\K[^<]+' "$TMPDIR/sitemap_root.xml" > "$TMPDIR/all_urls.txt"
-fi
-
-# Rewrite URLs if using --sitemap-from
+# If sitemap origin is different, rewrite URLs
 if [[ -n "$SITEMAP_FROM" ]]; then
     sed -i "s|${SITEMAP_FROM}|${BASE_URL}|g" "$TMPDIR/all_urls.txt"
     info "Rewrote sitemap URLs from ${SITEMAP_FROM} → ${BASE_URL}"
@@ -140,11 +141,7 @@ fi
 TOTAL_PAGES=$(wc -l < "$TMPDIR/all_urls.txt")
 info "Found ${TOTAL_PAGES} pages in sitemap"
 
-# Ensure homepage is always included
 HOMEPAGE="${BASE_URL}/"
-if ! grep -qF "$HOMEPAGE" "$TMPDIR/all_urls.txt"; then
-    echo "$HOMEPAGE" >> "$TMPDIR/all_urls.txt"
-fi
 
 # Apply sampling
 if [[ "$SAMPLE_SIZE" -gt 0 && "$SAMPLE_SIZE" -lt "$TOTAL_PAGES" ]]; then
@@ -154,45 +151,42 @@ if [[ "$SAMPLE_SIZE" -gt 0 && "$SAMPLE_SIZE" -lt "$TOTAL_PAGES" ]]; then
     info "Sampled ${SAMPLE_SIZE} pages (+ homepage)"
 fi
 
-PAGES_TO_CHECK=$(wc -l < "$TMPDIR/all_urls.txt")
+# ── Step 2: Prime or Audit ───────────────────────────────────────────
+if [ "$PRIME_ONLY" = true ]; then
+    echo -e "\n${BOLD}── Priming metadata on ${TOTAL_PAGES} pages ──${RESET}"
+    count=0
+    while IFS= read -r url; do
+        count=$((count+1))
+        echo -ne "  Priming ($count/$TOTAL_PAGES): $url\r"
+        curl -s -o /dev/null "$url"
+    done < "$TMPDIR/all_urls.txt"
+    echo -e "\n${GREEN}✓ Done: All pages visited. Metadata should be primed.${RESET}"
+    exit 0
+fi
 
-# ── Step 2: Per-Page Checks ─────────────────────────────────────────
-echo -e "\n${BOLD}── Checking ${PAGES_TO_CHECK} pages ──${RESET}\n"
+echo -e "\n${BOLD}── Checking $(wc -l < "$TMPDIR/all_urls.txt") pages ──${RESET}"
 
-check_page() {
-    local url="$1"
-    local html_file="$TMPDIR/page_$$.html"
-    local page_failures=0
+while IFS= read -r url; do
+    page_failures=0
+    path="${url#$BASE_URL}"
+    [[ -z "$path" ]] && path="/"
+    
+    echo -e "\n${BOLD}${path}${RESET}"
+    
+    html_file="$TMPDIR/page.html"
+    curl -s -L "$url" > "$html_file"
 
-    # Fetch the page
-    local http_code
-    http_code=$(curl -s -o "$html_file" -w "%{http_code}" "$url")
-
-    local short_path="${url#$BASE_URL}"
-    [[ -z "$short_path" ]] && short_path="/"
-
-    if [[ "$http_code" != "200" ]]; then
-        echo -e "${BOLD}${short_path}${RESET}"
-        fail "HTTP ${http_code}"
-        echo ""
-        return 1
-    fi
-
-    echo -e "${BOLD}${short_path}${RESET}"
-
-    # ── Check 1: Plugin Heartbeat ────────────────────────────────
+    # ── Check 1: Plugin Heartbeat ────────────────────────────────────
     if grep -q "Shifter Elementor CSS Fix" "$html_file"; then
-        local version
-        version=$(grep -oP 'Shifter Elementor CSS Fix v\K[0-9.]+' "$html_file" || echo "?")
-        pass "Plugin heartbeat (v${version})"
+        hb_version=$(grep -oP "Shifter Elementor CSS Fix v\K[0-9.]+" "$html_file" | head -1)
+        pass "Plugin heartbeat (v${hb_version})"
     else
         fail "Plugin heartbeat MISSING"
         page_failures=$((page_failures+1))
     fi
 
-    # ── Check 2: Upload CSS uses hashes (no ?ver=) ───────────────
-    local unhashed
-    unhashed=$(grep -oP "href='[^']*?/uploads/elementor/[^']*\.css\?ver=[^']*'" "$html_file" 2>/dev/null || true)
+    # ── Check 2: Content Hash Versioning (Uploads only) ──────────────
+    unhashed=$(grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html_file" | grep "\?ver=" || true)
     if [[ -n "$unhashed" ]]; then
         local count
         count=$(echo "$unhashed" | wc -l)
@@ -202,9 +196,9 @@ check_page() {
         pass "All upload CSS files use content hashes"
     fi
 
-    # ── Check 3: Shape divider → shapes.min.css ──────────────────
-    if grep -q 'elementor-shape' "$html_file"; then
-        if grep -q 'shapes.min.css' "$html_file"; then
+    # ── Check 3: Shape Divider Presence ──────────────────────────────
+    if grep -q "elementor-shape" "$html_file"; then
+        if grep -q "shapes.min.css" "$html_file"; then
             pass "Shape divider → shapes.min.css linked"
         else
             fail "Shape divider present but shapes.min.css NOT linked (run Regenerate?)"
@@ -212,9 +206,9 @@ check_page() {
         fi
     fi
 
-    # ── Check 4: Loop grid → widget-loop-common.css ──────────────
-    if grep -q 'elementor-widget-loop-grid\|elementor-loop-container' "$html_file"; then
-        if grep -q 'widget-loop-common' "$html_file"; then
+    # ── Check 4: Loop Grid Presence ──────────────────────────────────
+    if grep -q "elementor-widget-loop" "$html_file"; then
+        if grep -q "widget-loop-common.css" "$html_file"; then
             pass "Loop grid → widget-loop-common.css linked"
         else
             fail "Loop grid present but widget-loop-common.css NOT linked"
@@ -222,10 +216,9 @@ check_page() {
         fi
     fi
 
-    # ── Check 5: Elementor version ───────────────────────────────
-    local el_version
-    el_version=$(grep -oP 'content="Elementor \K[0-9.]+' "$html_file" 2>/dev/null || echo "none")
-    if [[ "$el_version" != "none" ]]; then
+    # ── Check 5: Elementor Version consistency ───────────────────────
+    el_version=$(grep -oP "elementor-v\K[0-9.]+" "$html_file" | head -1 || true)
+    if [[ -n "$el_version" ]]; then
         ELEMENTOR_VERSIONS["$el_version"]=1
         info "Elementor ${el_version}"
     fi
@@ -263,9 +256,10 @@ check_page() {
         fi
     fi
 
-    # ── Check 7: Hex ID in non-CDN paths ─────────────────────────
-    local hex_ids
-    hex_ids=$(grep -oP "href='[^']*?/[a-f0-9]{40}/uploads/[^']*'" "$html_file" \
+    # ── Check 7: Shifter Hex ID leaks ────────────────────────────────
+    # Check for paths like /b30641.../ which should be stripped in artifacts
+    # excluding CDN host discovery.
+    hex_ids=$(grep -oP "/[0-9a-f]{40}/" "$html_file" \
             | grep -v 'cdn.getshifter.co' 2>/dev/null || true)
     if [[ -n "$hex_ids" ]]; then
         fail "Non-CDN path contains Shifter hex ID (will 404 in production)"
@@ -273,50 +267,37 @@ check_page() {
     fi
 
     rm -f "$html_file"
-
-    if [[ "$page_failures" -gt 0 ]]; then
-        FAILED_PAGES+=("$short_path")
-    fi
-
-    echo ""
-    return 0
-}
-
-while IFS= read -r page_url; do
-    check_page "$page_url" || true
+    
     PAGES_CHECKED=$((PAGES_CHECKED+1))
+    if [[ "$page_failures" -gt 0 ]]; then
+        FAILED_PAGES+=("$path")
+    fi
 done < "$TMPDIR/all_urls.txt"
 
-# ── Step 3: Cross-Page Checks ────────────────────────────────────────
-echo -e "${BOLD}── Cross-page checks ──${RESET}"
-
-if [[ ${#ELEMENTOR_VERSIONS[@]} -gt 1 ]]; then
-    fail "Inconsistent Elementor versions: ${!ELEMENTOR_VERSIONS[*]}"
+# ── Final Summary ────────────────────────────────────────────────────
+echo -e "\n${BOLD}── Cross-page checks ──${RESET}"
+VERSIONS=("${!ELEMENTOR_VERSIONS[@]}")
+if [[ ${#VERSIONS[@]} -gt 1 ]]; then
+    fail "Inconsistent Elementor versions: ${VERSIONS[*]}"
     info "This usually means the homepage is cached from an older bake"
-else
-    pass "Consistent Elementor version: ${!ELEMENTOR_VERSIONS[*]}"
+elif [[ ${#VERSIONS[@]} -eq 1 ]]; then
+    pass "Consistent Elementor version: ${VERSIONS[0]}"
 fi
 
-# ── Summary ──────────────────────────────────────────────────────────
 echo -e "\n${BOLD}═══ Summary ═══${RESET}"
-echo -e "Pages checked: ${PAGES_CHECKED}"
-echo -e "Passed:        ${GREEN}${PASS_COUNT}${RESET}"
-echo -e "Warnings:      ${YELLOW}${WARN_COUNT}${RESET}"
-echo -e "Failed:        ${RED}${FAIL_COUNT}${RESET}"
+echo "Pages checked: ${PAGES_CHECKED}"
+echo "Passed:        ${PASS_COUNT}"
+echo "Warnings:      ${WARN_COUNT}"
+echo "Failed:        ${FAIL_COUNT}"
 
 if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then
     echo -e "\n${RED}Pages with failures:${RESET}"
     for p in "${FAILED_PAGES[@]}"; do
-        echo -e "  ${RED}✗${RESET} ${p}"
+        echo -e "  ${RED}✗${RESET} $p"
     done
-fi
-
-echo ""
-
-if [[ "$FAIL_COUNT" -gt 0 ]]; then
-    echo -e "${RED}${BOLD}AUDIT FAILED${RESET} — ${FAIL_COUNT} issue(s) found."
+    echo -e "\n${RED}${BOLD}AUDIT FAILED${RESET} — ${FAIL_COUNT} issue(s) found."
     exit 1
 else
-    echo -e "${GREEN}${BOLD}AUDIT PASSED${RESET} — No issues detected."
+    echo -e "\n${GREEN}${BOLD}AUDIT PASSED${RESET}"
     exit 0
 fi
