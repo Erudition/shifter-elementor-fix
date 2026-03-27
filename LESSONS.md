@@ -32,3 +32,13 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Issue**: Shifter generates pages in parallel. Multiple PHP processes may try to generate or copy the same shared CSS file at the exact same millisecond.
 *   **The Result**: Build-time deadlocks and "partially written" (corrupted) CSS files.
 *   **The Solution**: Implement `flock()` on sidecar `.lock` files. This ensures only one process writes the hashed file at a time, protecting file integrity and reducing 15+ minute build times down to seconds.
+
+## 7. Do NOT "Regenerate Files & Data" Before a Bake (Critical)
+*   **The Issue**: Elementor's "Regenerate Files & Data" clears its internal metadata about which conditional assets (e.g., `shapes.min.css`, `e-swiper.min.css`) are needed on each page. During a normal browser visit, Elementor re-detects the widgets and re-enqueues the conditional CSS. But during a Shifter bake, the headless crawler may not trigger re-detection for every page.
+*   **The Result**: Conditional stylesheets are silently dropped from the `<head>` of affected pages. Shape dividers lose their `position: absolute` and render inline. Loop carousels lose their layout.
+*   **The Evidence**: Bake `6038cd65` (after Regenerate) had `shapes.min.css` missing on 80% of pages. Bake `7e39db6f` (without Regenerate) had it on 100%.
+*   **The Rule**: Never run "Regenerate Files & Data" before a Shifter bake. Only run it during active editing sessions where a normal browser will visit each page afterward.
+
+## 8. Plugin CSS vs. Upload CSS
+*   **The Issue**: Files in `/wp-content/plugins/` are served directly by the web server, not via the CDN. They are not affected by CDN caching bugs.
+*   **The Rule**: The versioning plugin should only touch files in `/wp-content/uploads/elementor/`. Core plugin CSS (like `shapes.min.css`) must not be modified, relocated, or hashed — doing so is unnecessary and risks breaking Elementor's conditional loading system.
