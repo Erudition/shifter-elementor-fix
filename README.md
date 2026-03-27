@@ -19,6 +19,8 @@ The suggested workaround is usually to use Elementor's "Internal Embedding" mode
 
 Most of these are gnarly CSS specificity bugs that you can't fix without editing Elementor -- the styles are usually all there, but in the wrong order, with weird interactions, and in my experience base template styles end up taking precedence over a page's specific styles, for example. Good luck tracking those down, if you do manage to realize that Internal Embedding is the culprit.
 
+By using External File stylesheets, one artifact for example was 12.4% smaller, with 1895 files instead of 1911. (And that's not even including any of the site-specific stylesheets -- those are hosted on the CDN and excluded from artifact downloads.)
+
 # Unique filenames - almost works
 
 The fix I've been using is a small snippet that renames the files upon creation to use that same `?ver=` string in the filename, and updating all links accordingly. This works!
@@ -29,9 +31,9 @@ Worse, Elementor's CSS generation process happens in a few phases, with placehol
 
 In my experience, when the site gets relatively large, these factors combine to a point where
 
-- Artifact generation takes *forever*. I'm talking 15, sometimes 20 minutes, for a few hundred mostly-identical pages.
+- Artifact generation takes *forever*. I'm talking 15, sometimes 20 minutes, for a few hundred mostly-identical pages. This is about the same as with Internal Embedding, however.
 - Some pages are broken. The styles just don't load, and you have to regenerate to get it to come back. Using Elementor's "Regenerate Styles" button doesn't help, because they're generated from scratch anyway during the build process, since it doesn't see anything in the local /uploads/ folder.
-- When you regenerate that same site, the broken page may be fixed. But what you may not immediately find, is... other pages broke! It is a non-deterministic problem where you play whack-a-mole with broken pages until you think you've finally got a good artifact. When there are hundreds of pages, and only one or two are broken, it's easy to be wrong about that. The code of the broken page is almost exactly the same as the one with the correct stylesheet linked.
+- When you regenerate that same site, the broken page may be fixed. But what you may (not immediately) find, is... other pages broke! It is a non-deterministic problem where you play whack-a-mole with broken pages until you think you've finally got a good artifact. When there are hundreds of pages, and only one or two are broken, it's easy to be wrong about that. The code of the broken page is almost exactly the same as the one with the correct stylesheet linked.
 
 # Using a Snippet - Forbidden
 

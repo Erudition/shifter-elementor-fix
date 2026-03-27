@@ -2,29 +2,22 @@
 /**
  * Plugin Name: Shifter Elementor CSS Fix
  * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
- * Version: 2.6
+ * Version: 2.7
  * Author: Antigravity AI
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
 /**
- * Log function for Shifter execution context.
- */
-function shifter_log($message) {
-    if (!is_scalar($message)) {
-        $message = print_r($message, true);
-    }
-    $log_file = WP_CONTENT_DIR . '/uploads/shifter_log.txt';
-    @error_log("[" . date('Y-m-d H:i:s') . "] " . (string)$message . "\n", 3, $log_file);
-}
-
-/**
  * Concurrency lock to prevent file corruption during parallel requests during the Shifter bake process.
  */
 function shifter_concurrency_lock($local_path) {
+    if (!is_string($local_path)) {
+        return;
+    }
+    
     static $locked = [];
-    if (!is_string($local_path) || isset($locked[$local_path])) {
+    if (isset($locked[$local_path])) {
         return;
     }
     
@@ -48,7 +41,7 @@ function shifter_css_filename_versioning($src, $handle) {
         return $src;
     }
     
-    // Filter only Elementor-managed assets
+    // Filter only Elementor-managed assets (including Google Fonts)
     if (strpos($src, '/elementor/') === false || strpos($src, '.css') === false) {
         return $src;
     }
@@ -57,19 +50,22 @@ function shifter_css_filename_versioning($src, $handle) {
     $path = isset($url['path']) ? $url['path'] : '';
     
     /**
-     * Resolve Local Paths (Hostname-Agnostic)
+     * Resolve Local Paths (Shifter-Agnostic)
      */
     $upload_dir = wp_upload_dir(null, false);
-    $upload_base_path = $upload_dir['basedir'];
-    $upload_base_url_path = parse_url($upload_dir['baseurl'], PHP_URL_PATH);
-
-    // Ensure we are dealing with a local upload file
-    if (strpos($path, $upload_base_url_path) !== 0) {
+    $upload_base_path = rtrim($upload_dir['basedir'], '/');
+    
+    // Find the relative path of the file WITHIN the uploads directory.
+    // This allows us to bypass Shifter's internal ID prefixes or absolute URLs
+    $upload_token = '/uploads/';
+    $pos = strpos($path, $upload_token);
+    
+    if ($pos === false) {
         return $src;
     }
 
-    $rel_path = substr($path, strlen($upload_base_url_path));
-    $local_path = $upload_base_path . $rel_path;
+    $rel_path = substr($path, $pos + strlen($upload_token));
+    $local_path = $upload_base_path . '/' . ltrim($rel_path, '/');
 
     if (!file_exists($local_path)) {
         return $src;
@@ -86,9 +82,9 @@ function shifter_css_filename_versioning($src, $handle) {
     }
     $hash = $hash_cache[$local_path];
 
-    // New filename pattern: filename.[md5].css
+    // New filename pattern: prefix.[md5].css
     $new_path = str_replace('.css', '.' . $hash . '.css', $path);
-    $new_local_path = $upload_base_path . substr($new_path, strlen($upload_base_url_path));
+    $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path, $pos + strlen($upload_token)), '/');
 
     /**
      * Atomic Copy with Lock
@@ -105,7 +101,7 @@ function shifter_css_filename_versioning($src, $handle) {
      * Construct final URL
      */
     $scheme = isset($url['scheme']) ? $url['scheme'] . '://' : '//';
-    $host = isset($url['host']) ? $url['host'] : $_SERVER['HTTP_HOST'];
+    $host = isset($url['host']) ? $url['host'] : (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : parse_url(get_site_url(), PHP_URL_HOST));
     
     // Strip query string as it's now in the filename
     return $scheme . $host . $new_path;
