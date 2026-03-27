@@ -2,11 +2,18 @@
 /**
  * Plugin Name: Shifter Elementor CSS Fix
  * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
- * Version: 2.7
+ * Version: 2.8
  * Author: Antigravity AI
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
+
+/**
+ * Add a debug signature to the HTML to verify the plugin is active in bakes.
+ */
+add_action( 'wp_head', function() {
+    echo "\n<!-- Shifter Elementor CSS Fix v2.8 ACTIVE -->\n";
+}, 1 );
 
 /**
  * Concurrency lock to prevent file corruption during parallel requests during the Shifter bake process.
@@ -82,8 +89,11 @@ function shifter_css_filename_versioning($src, $handle) {
     }
     $hash = $hash_cache[$local_path];
 
-    // New filename pattern: prefix.[md5].css
-    $new_path = str_replace('.css', '.' . $hash . '.css', $path);
+    /**
+     * Rename the file to include the hash.
+     * Use preg_replace to ensure we only target the final .css extension.
+     */
+    $new_path = preg_replace('/\.css$/', '.' . $hash . '.css', $path);
     $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path, $pos + strlen($upload_token)), '/');
 
     /**
@@ -98,11 +108,10 @@ function shifter_css_filename_versioning($src, $handle) {
     }
 
     /**
-     * Construct final URL
+     * Output root-relative path.
+     * Returning a site-root relative path (starting with /) ensures the Shifter
+     * generator/crawler finds the file on the local instance filesystem.
      */
-    $scheme = isset($url['scheme']) ? $url['scheme'] . '://' : '//';
-    $host = isset($url['host']) ? $url['host'] : (isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : parse_url(get_site_url(), PHP_URL_HOST));
-    
-    // Strip query string as it's now in the filename
-    return $scheme . $host . $new_path;
+    return $new_path;
 }
+
