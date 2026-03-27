@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Shifter Elementor CSS Fix
  * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
- * Version: 2.8
+ * Version: 2.9
  * Author: Antigravity AI
  */
 
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Add a debug signature to the HTML to verify the plugin is active in bakes.
  */
 add_action( 'wp_head', function() {
-    echo "\n<!-- Shifter Elementor CSS Fix v2.8 ACTIVE -->\n";
+    echo "\n<!-- Shifter Elementor CSS Fix v2.9 ACTIVE -->\n";
 }, 1 );
 
 /**
@@ -91,10 +91,10 @@ function shifter_css_filename_versioning($src, $handle) {
 
     /**
      * Rename the file to include the hash.
-     * Use preg_replace to ensure we only target the final .css extension.
+     * We calculate the new local path for the filesystem copy.
      */
-    $new_path = preg_replace('/\.css$/', '.' . $hash . '.css', $path);
-    $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path, $pos + strlen($upload_token)), '/');
+    $new_path_fragment = preg_replace('/\.css$/', '.' . $hash . '.css', $path);
+    $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path_fragment, $pos + strlen($upload_token)), '/');
 
     /**
      * Atomic Copy with Lock
@@ -108,10 +108,12 @@ function shifter_css_filename_versioning($src, $handle) {
     }
 
     /**
-     * Output root-relative path.
-     * Returning a site-root relative path (starting with /) ensures the Shifter
-     * generator/crawler finds the file on the local instance filesystem.
+     * Final URL construction:
+     * Surgically replace only the filename in the original $src string.
+     * This ensures the hostname, Shifter-specific ID, and scheme remain 
+     * exactly as provided by WordPress/Elementor.
      */
-    return $new_path;
+    return preg_replace('/\.css$/', '.' . $hash . '.css', $src);
 }
+
 
