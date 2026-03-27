@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Shifter Elementor CSS Fix
- * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with filename-based versioning to bypass CDN caching issues.
- * Version: 2.4
+ * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
+ * Version: 2.6
  * Author: Antigravity AI
  */
 
@@ -28,7 +28,7 @@ function shifter_concurrency_lock($local_path) {
         return;
     }
     
-    // Directory level lock since Elementor writes multiple files
+    // Create a sidecar lock file
     $lock_handle = @fopen($local_path . '.copy.lock', 'w+');
     if ($lock_handle && @flock($lock_handle, LOCK_EX)) {
         $locked[$local_path] = $lock_handle;
@@ -39,7 +39,7 @@ function shifter_concurrency_lock($local_path) {
 
 /**
  * Filter: style_loader_src
- * Intercepts Elementor CSS files and versions them via filename.
+ * Intercepts Elementor CSS files and versions them via content-hash filename.
  */
 add_filter('style_loader_src', 'shifter_css_filename_versioning', 999, 2);
 
@@ -48,30 +48,14 @@ function shifter_css_filename_versioning($src, $handle) {
         return $src;
     }
     
-    // Filter only Elementor CSS files
-    if (strpos($src, 'elementor/css/') === false) {
+    // Filter only Elementor-managed assets
+    if (strpos($src, '/elementor/') === false || strpos($src, '.css') === false) {
         return $src;
     }
 
     $url = parse_url($src);
-    if (!isset($url['query'])) {
-        return $src;
-    }
+    $path = isset($url['path']) ? $url['path'] : '';
     
-    parse_str($url['query'], $q);
-    if (!isset($q['ver'])) {
-        return $src;
-    }
-
-    $ver = $q['ver'];
-    $path = $url['path'];
-    if (strpos($path, '.css') === false) {
-        return $src;
-    }
-
-    // New filename-based versioning pattern: filename.[timestamp].css
-    $new_path = str_replace('.css', '.' . $ver . '.css', $path);
-
     /**
      * Resolve Local Paths (Hostname-Agnostic)
      */
@@ -79,30 +63,42 @@ function shifter_css_filename_versioning($src, $handle) {
     $upload_base_path = $upload_dir['basedir'];
     $upload_base_url_path = parse_url($upload_dir['baseurl'], PHP_URL_PATH);
 
-    // Ensure we are only dealing with upload files
+    // Ensure we are dealing with a local upload file
     if (strpos($path, $upload_base_url_path) !== 0) {
         return $src;
     }
 
     $rel_path = substr($path, strlen($upload_base_url_path));
     $local_path = $upload_base_path . $rel_path;
+
+    if (!file_exists($local_path)) {
+        return $src;
+    }
+
+    /**
+     * Generate Content-Based Hash
+     * Use a static cache to avoid redundant MD5 calls in a single request.
+     */
+    static $hash_cache = [];
+    if (!isset($hash_cache[$local_path])) {
+        // Grab first 10 chars of MD5 for a clean, stable version string
+        $hash_cache[$local_path] = substr(md5_file($local_path), 0, 10);
+    }
+    $hash = $hash_cache[$local_path];
+
+    // New filename pattern: filename.[md5].css
+    $new_path = str_replace('.css', '.' . $hash . '.css', $path);
     $new_local_path = $upload_base_path . substr($new_path, strlen($upload_base_url_path));
 
     /**
-     * Create the versioned file if it doesn't exist
+     * Atomic Copy with Lock
      */
-    if (file_exists($local_path)) {
-        shifter_concurrency_lock($local_path); // Lock during creation
+    if (!file_exists($new_local_path)) {
+        shifter_concurrency_lock($local_path); // Ensure file is stable before copy
         
-        if (!file_exists($new_local_path)) {
-            if (!@copy($local_path, $new_local_path)) {
-                // Return original src if copy fails to avoid 404
-                return $src;
-            }
+        if (!@copy($local_path, $new_local_path)) {
+            return $src; // Fallback to original on failure
         }
-    } else {
-        // Source file not found on disk, return original to avoid path corruption
-        return $src;
     }
 
     /**
@@ -110,5 +106,7 @@ function shifter_css_filename_versioning($src, $handle) {
      */
     $scheme = isset($url['scheme']) ? $url['scheme'] . '://' : '//';
     $host = isset($url['host']) ? $url['host'] : $_SERVER['HTTP_HOST'];
+    
+    // Strip query string as it's now in the filename
     return $scheme . $host . $new_path;
 }
