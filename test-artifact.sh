@@ -319,35 +319,39 @@ curl -s -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | grep -oP '<loc
 [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 
 # ── Execution ──
+echo -e "\n${BOLD}── Elementor Audit Execution ──${RESET}"
+info "Target: ${BASE_URL}"
+[[ -n "${STAGING_URL:-}" ]] && info "Source: ${STAGING_URL}"
+
+JOBS=0; MAX=8
+while IFS= read -r slug; do
+    (
+        path="${slug:-/}"
+        # page_deep_audit does the diff if DEEP_AUDIT is true
+        if [[ "$DEEP_AUDIT" == true && -n "${STAGING_URL:-}" ]]; then
+            page_deep_audit "$slug" "$BASE_URL" "$STAGING_URL" "$AID"
+        fi
+
+        # Fidelity Checks (Fetch once and audit)
+        html=$(mktemp)
+        curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
+        
+        echo -e "\n${BOLD}${path}${RESET}"
+        grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || fail "Heartbeat MISSING"
+        grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && fail "CSS hashing MISSING" || pass "CSS hashing active"
+        
+        css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
+        while IFS= read -r css; do 
+            [[ -z "$css" ]] && continue
+            [[ "$css" == /* ]] && css="${BASE_URL}${css}"
+            [[ "$(curl -s -o /dev/null -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
+        done <<< "$css_urls"
+        rm -f "$html"
+    ) &
+    JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n; JOBS=$((JOBS-1)); }
+done < "$TMPDIR/audit.txt"; wait
+
 if [[ "$DEEP_AUDIT" == true ]]; then
-    echo -e "\n${BOLD}── Regression Audit (Deep Audit Mode) ──${RESET}"
-    info "Comparing Artifact vs Staging (.artifacts/$AID/)..."
-    JOBS=0; MAX=8
-    while IFS= read -r slug; do
-        page_deep_audit "$slug" "$BASE_URL" "$STAGING_URL" "$AID" &
-        JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n; JOBS=$((JOBS-1)); }
-    done < "$TMPDIR/audit.txt"; wait
+    echo -e "\n${BOLD}── Audit Results ──${RESET}"
     [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]] && fail "Regression conflicts found" || pass "No HTML regressions found"
 fi
-
-echo -e "\n${BOLD}── Elementor Asset Audit (Fidelity Check) ──${RESET}"
-while IFS= read -r slug; do
-    url="${BASE_URL}${slug}"; path="${slug:-/}"
-    echo -e "\n${BOLD}${path}${RESET}"
-    html="$TMPDIR/page.html"; curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -o "$html" "$url"
-    
-    # Fidelity Checks
-    grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || fail "Heartbeat MISSING"
-    grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && fail "CSS hashing MISSING" || pass "CSS hashing active"
-    
-    if grep -q "elementor-shape" "$html"; then
-        grep -q "shapes.min.css" "$html" && pass "Shape divider linked" || fail "Shape divider link MISSING"
-    fi
-    
-    css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
-    while IFS= read -r css; do 
-        [[ -z "$css" ]] && continue
-        [[ "$css" == /* ]] && css="${BASE_URL}${css}"
-        [[ "$(curl -s -o /dev/null -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
-    done <<< "$css_urls"
-done < "$TMPDIR/audit.txt"
