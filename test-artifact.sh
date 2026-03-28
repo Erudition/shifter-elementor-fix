@@ -311,7 +311,7 @@ page_deep_audit() {
     # Note: grep -v returns exit 1 if no matches are found (which is our goal).
     # We must assign it separately from 'local' to ensure 'set -e' doesn't kill the subshell.
     local structural_diff
-    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -i -v "\[move|^$|starship" | tr -d '[:space:]' || true)
+    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$" | tr -d '[:space:]' || true)
     
     # Generate human-readable unified diff for debugging if ANY differences exist
     diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1 || true
@@ -456,3 +456,13 @@ if [[ "$DEEP_AUDIT" == true ]]; then
     echo -e "\n${BOLD}── Audit Results ──${RESET}"
     [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]] && fail "Regression conflicts found" || pass "No HTML regressions found"
 fi
+
+# ── Final Cleanup ──
+if [[ "$DEEP_AUDIT" == true && -d "$ARTIFACTS_DIR/$AID" ]]; then
+    # Sweep any empty parent directories left behind by parallel race conditions
+    find "$ARTIFACTS_DIR/$AID" -type d -empty -delete 2>/dev/null
+    # If the entire site was clean, remove the AID folder too
+    rmdir "$ARTIFACTS_DIR/$AID" 2>/dev/null || true
+fi
+
+echo -e "\n${BOLD}${GREEN}Audit process complete.${RESET}"
