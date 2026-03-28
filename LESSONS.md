@@ -33,16 +33,12 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Result**: Build-time deadlocks and "partially written" (corrupted) CSS files.
 *   **The Solution**: Implement `flock()` on sidecar `.lock` files. This ensures only one process writes the hashed file at a time, protecting file integrity and reducing 15+ minute build times down to seconds.
 
-## 7. The "Regenerate & Prime" Workflow (Critical)
-*   **The Issue**: Elementor's "Regenerate Files & Data" clears its internal metadata about which conditional assets (e.g., `shapes.min.css`, `e-swiper.min.css`) are needed on each page.
-*   **The Difference (Staging vs. Bake)**: On the **Staging Site** (`.static.getshifter.net`), visiting a page in a browser triggers re-detection and fixes the metadata for that page. However, the Shifter static generator ("Bake") is often headless/fast and may not trigger this re-detection.
-*   **The Result**: Conditional stylesheets are silently dropped from the static artifact if the metadata was cleared and not "primed" before the bake.
-*   **The Solution**: After running "Regenerate," you MUST visit critical pages (or use an automated script) on the **Staging Site** (`.static.getshifter.net`) while logged in to "Prime" the metadata before stopping WordPress for a bake.
+## 7. The Performance Lab (Meta-Plugin) Conflict (Definitive)
+*   **The Issue**: The **Performance Lab (v4.1.0+)** meta-plugin performs a global optimization (likely its "Asset Manager" or a hidden pre-processing filter) that strips Elementor conditional assets (e.g., `shapes.min.css`) during both live renders and static bakes.
+*   **The Symptom**: Shape dividers lose their `position: absolute` and render inline, while loop grids lose their basic common-layout styles.
+*   **The Evidence**: Deactivating the meta-plugin **instantly** restores these styles site-wide without requiring metadata regeneration or "Priming."
+*   **The Rule**: Keep the Performance Lab meta-plugin DEACTIVATED on Shifter. Its presence is incompatible with how Elementor and Shifter interact.
 
 ## 8. Plugin CSS vs. Upload CSS
-*   **The Issue**: Files in `/wp-content/plugins/` are served directly by the web server (or production CDN), not the static artifact's private `/uploads/` bucket.
-*   **The Rule**: The versioning plugin should ONLY touch files in `/wp-content/uploads/elementor/`. Core plugin CSS (like `shapes.min.css`) must not be modified, as they are not subject to the same concurrency/caching bugs and are handled correctly by Elementor's internal loader.
-
-## 9. False Positives: Plugin Conflicts
-*   **The Lesson**: Do not assume a site-wide style failure is a plugin conflict (e.g., "Performance Lab"). 
-*   **The Test**: Always check if the failure is **fragmented** (present on some pages but not others). If `/courses/` works but a subpage doesn't on the same staging site, it is a **Metadata Priming** issue, not a code conflict.
+*   **The Issue**: Files in `/wp-content/plugins/` are served correctly by the Shifter web server or the production CDN. They are NOT stored in the `/uploads/` bucket and do not experience the same concurrency or duplication bugs.
+*   **The Rule**: The versioning plugin should ONLY touch files in `/wp-content/uploads/elementor/`. Modifying core plugin CSS is unnecessary and risks breaking Elementor's native dependency tree.

@@ -122,7 +122,7 @@ echo -e "${BOLD}── Discovering pages ──${RESET}"
 SITEMAP_ORIGIN="${SITEMAP_FROM:-$BASE_URL}"
 SITEMAP_URL="${SITEMAP_ORIGIN}/sitemap.xml"
 
-if ! curl -s --head "$SITEMAP_URL" | grep -q "200 OK"; then
+if ! curl -s --head "$SITEMAP_URL" | grep -q '200'; then
     echo -e "${RED}Error: Sitemap not found at ${SITEMAP_URL}${RESET}"
     exit 2
 fi
