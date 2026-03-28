@@ -268,6 +268,18 @@ fi
 
 [[ -z "$BASE_URL" ]] && usage
 SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
+
+# Wait for Staging Readiness
+if [[ -n "${STAGING_URL:-}" ]]; then
+    info "Waiting for Staging to be responsive at ${SITEMAP_URL}..." >&2
+    local s_status=0; local retry=0
+    while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
+        s_status=$(curl -s -L -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
+        [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
+    done
+    [[ "$s_status" != "200" ]] && { echo -e "\n${RED}Error: Staging sitemap unreachable.${RESET}" >&2; exit 1; }
+    echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
+fi
 TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
 curl -s "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' | sed "s|https://[^/]*||g" > "$TMPDIR/all_slugs.txt"
 [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
