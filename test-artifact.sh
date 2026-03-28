@@ -33,6 +33,7 @@ PRIME_ONLY=false
 USE_API=false
 DO_BAKE=false
 DEEP_AUDIT=false
+BAKE_NAME="Full Lifecycle Regression Audit"
 SITE_ID=""
 ACCESS_TOKEN=""
 DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e" # NCPC
@@ -55,6 +56,7 @@ usage() {
     echo ""
     echo "  --api               Automatically find and audit the latest artifact"
     echo "  --bake              Trigger a full build cycle (Stop WP → Bake → Audit → Start WP)"
+    echo "  --name TITLE        Title for the new Artifact (Default: Full Lifecycle Regression Audit)"
     echo "  --deep-audit        Perform side-by-side HTML diffing (Artifact vs Staging)"
     echo "  --site-id ID        Shifter Site ID (Default: NationalCPC)"
     echo "  --sample N          Test only N random pages (+ homepage)"
@@ -151,13 +153,20 @@ shifter_get_latest_artifact() {
 shifter_stop_wordpress() {
     local site_id="$1"
     info "Stopping WordPress instance..." >&2
+    local status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
+    
+    if [[ "$status" != "inservice" && "$status" != "starting" && "$status" != "stopping" ]]; then
+        echo -e "  ${GREEN}✓${RESET} WordPress is not in-service (${status})" >&2
+        return 0
+    fi
+
     curl -s "https://api.getshifter.io/latest/sites/${site_id}/wordpress_site/stop" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
-    local status="inservice"
-    while [[ "$status" != "stopped" ]]; do
+    while [[ "$status" == "inservice" || "$status" == "stopping" ]]; do
+        echo -ne "  ${YELLOW}⌛ Transitioning to stopped... (Current: ${status})\r${RESET}" >&2
+        sleep 5
         status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
-        [[ "$status" != "stopped" ]] && sleep 5
     done
-    echo -e "  ${GREEN}✓${RESET} WordPress stopped" >&2
+    echo -e "\n  ${GREEN}✓${RESET} WordPress stopped" >&2
 }
 
 shifter_start_wordpress() {
@@ -175,8 +184,10 @@ shifter_start_wordpress() {
 
 shifter_start_bake() {
     local site_id="$1"
-    info "Starting new Bake (Generating Artifact)..." >&2
-    local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -X POST -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
+    local title="${2:-$BAKE_NAME}"
+    info "Starting new Bake: ${BOLD}${title}${RESET} (Generating Artifact)..." >&2
+    local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" \
+        -X POST -d "{\"title\":\"$title\"}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
     [[ -z "$aid" || "$aid" == "null" ]] && { echo -e "${RED}Error: Failed to start bake.${RESET}" >&2; exit 1; }
     echo "$aid"
 }
@@ -226,6 +237,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) USE_API=true; shift ;;
         --bake) DO_BAKE=true; USE_API=true; shift ;;
+        --name) BAKE_NAME="$2"; shift 2 ;;
         --deep-audit) DEEP_AUDIT=true; shift ;;
         --site-id) SITE_ID="$2"; shift 2 ;;
         --sample) SAMPLE_SIZE="$2"; shift 2 ;;
@@ -240,7 +252,7 @@ if [[ "$USE_API" == true ]]; then
     STAGING_URL="https://${SITE_ID}.static.getshifter.net"
     if [[ "$DO_BAKE" == true ]]; then
         shifter_stop_wordpress "$SITE_ID"
-        AID=$(shifter_start_bake "$SITE_ID")
+        AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
         shifter_wait_for_bake "$SITE_ID" "$AID"
         shifter_launch_preview "$SITE_ID" "$AID"
         shifter_start_wordpress "$SITE_ID"
