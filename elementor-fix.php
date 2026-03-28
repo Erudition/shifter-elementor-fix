@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Shifter Elementor CSS Fix
  * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
- * Version: 3.0
+ * Version: 3.1
  * Author: Antigravity AI
  */
 
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Add a debug signature to the HTML to verify the plugin is active in bakes.
  */
 add_action( 'wp_head', function() {
-    echo "\n<!-- Shifter Elementor CSS Fix v3.0 ACTIVE -->\n";
+    echo "\n<!-- Shifter Elementor CSS Fix v3.1 ACTIVE -->\n";
 }, 1 );
 
 /**
