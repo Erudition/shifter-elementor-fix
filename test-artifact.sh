@@ -36,8 +36,8 @@ DEEP_AUDIT=false
 SITE_ID=""
 ACCESS_TOKEN=""
 DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e" # NCPC
-ENV_FILE=".env"
-ARTIFACTS_DIR=".artifacts"
+ENV_FILE="$(dirname "$0")/.env"
+ARTIFACTS_DIR="$(dirname "$0")/.artifacts"
 
 declare -A ELEMENTOR_VERSIONS=()
 declare -a FAILED_PAGES=()
