@@ -56,3 +56,8 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Issue**: Shifter's static architecture (folders containing `index.html`) relies on the trailing slash for correct CloudFront resolution.
 *   **The Symptom**: Accessing a directory path without a trailing slash (e.g., `/course/awr-136`) often results in a **403 Forbidden** (LambdaGeneratedResponse) from CloudFront, or an incorrect redirect to an internal staging URL.
 *   **The Rule**: Always append a trailing slash to all internal URLs. The audit tool is now configured to enforce this on all discovered slugs.
+## 13. Preview Asset Referer Protection (CloudFront)
+*   **The Issue**: Shifter's `.preview.getshifter.io` domain uses a CloudFront distribution that enforces "Hotlink Protection" or "Same-Origin" policies for static assets (`.css`, `.js`, `.png`, etc.).
+*   **The Symptom**: `curl` requests for assets return **403 Forbidden** (LambdaGeneratedResponse), while the same assets load correctly in a browser. HTML pages (`text/html`) are usually exempt.
+*   **The Solution**: All `curl` requests for assets on the preview domain **MUST** include a `Referer` header matching the base preview URL (e.g., `-H "Referer: https://[AID].preview.getshifter.io/"`).
+*   **The Rule**: Never attempt to audit or scrape Shifter preview assets with `curl` without the local `Referer` header.

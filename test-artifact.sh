@@ -249,8 +249,9 @@ page_deep_audit() {
     local safe_s="${slug%/}"; safe_s="${safe_s#/}"
     [[ -z "$safe_s" ]] && safe_s="homepage"
     local folder="$ARTIFACTS_DIR/$aid/$safe_s"; mkdir -p "$folder"
-    curl -s -L -o "$folder/artifact.html" "${artifact_base}${slug}"
-    curl -s -L -o "$folder/staging.html" "${staging_base}${slug}"
+    # Fetch with Referer header to bypass CloudFront hotlink protection
+    curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}"
+    curl -s -L -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}"
     
     # Audit logic
     if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1; then 
@@ -307,14 +308,14 @@ if [[ -n "${STAGING_URL:-}" ]]; then
     info "Waiting for Staging to be responsive at ${SITEMAP_URL}..." >&2
     s_status=0; retry=0
     while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
-        s_status=$(curl -s -L -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
+        s_status=$(curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
         [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
     done
     [[ "$s_status" != "200" ]] && { echo -e "\n${RED}Error: Staging sitemap unreachable.${RESET}" >&2; exit 1; }
     echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
 fi
 TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
-curl -s "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' | sed "s|https://[^/]*||g" > "$TMPDIR/all_slugs.txt"
+curl -s -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' | sed "s|https://[^/]*||g" > "$TMPDIR/all_slugs.txt"
 [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 
 # ── Execution ──
@@ -333,7 +334,7 @@ echo -e "\n${BOLD}── Elementor Asset Audit (Fidelity Check) ──${RESET}"
 while IFS= read -r slug; do
     url="${BASE_URL}${slug}"; path="${slug:-/}"
     echo -e "\n${BOLD}${path}${RESET}"
-    html="$TMPDIR/page.html"; curl -s -L -o "$html" "$url"
+    html="$TMPDIR/page.html"; curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -o "$html" "$url"
     
     # Fidelity Checks
     grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || fail "Heartbeat MISSING"
@@ -347,6 +348,6 @@ while IFS= read -r slug; do
     while IFS= read -r css; do 
         [[ -z "$css" ]] && continue
         [[ "$css" == /* ]] && css="${BASE_URL}${css}"
-        [[ "$(curl -s -o /dev/null -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
+        [[ "$(curl -s -o /dev/null -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
     done <<< "$css_urls"
 done < "$TMPDIR/audit.txt"
