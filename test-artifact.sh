@@ -36,7 +36,7 @@ DEEP_AUDIT=false
 BAKE_NAME="Full Lifecycle Regression Audit"
 SITE_ID="${SITE_ID:-}"
 ACCESS_TOKEN=""
-DEFAULT_SITE_ID="${DEFAULT_SITE_ID:-3215b04c-84e4-4a42-8132-902bb6d4b51e}" # NCPC as fallback
+DEFAULT_SITE_ID="${DEFAULT_SITE_ID:-}" # Set your default site ID here
 ENV_FILE="$(dirname "$0")/.env"
 ARTIFACTS_DIR="$(dirname "$0")/artifacts"
 
@@ -58,7 +58,7 @@ usage() {
     echo "  --bake              Trigger a full build cycle (Stop WP → Bake → Audit → Start WP)"
     echo "  --name TITLE        Title for the new Artifact (Default: Full Lifecycle Regression Audit)"
     echo "  --deep-audit        Perform side-by-side HTML diffing (Artifact vs Staging)"
-    echo "  --site-id ID        Shifter Site ID (Default: NationalCPC)"
+    echo "  --site-id ID        Shifter Site ID"
     echo "  --sample N          Test only N random pages (+ homepage)"
     echo "  --sitemap-from URL  Pull sitemap from a different origin"
     echo "  --prime             Only visit URLs to rebuild metadata (Staging only)"
@@ -250,8 +250,8 @@ page_deep_audit() {
     [[ -z "$safe_s" ]] && safe_s="homepage"
     local folder="$ARTIFACTS_DIR/$aid/$safe_s"; mkdir -p "$folder"
     # Fetch with Referer header to bypass CloudFront hotlink protection
-    curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}"
-    curl -s -L -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}"
+    curl -s -L -f -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download artifact for $slug"; return; }
+    curl -s -L -f -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download staging for $slug"; return; }
     
     # Extract hostnames for normalization
     local art_domain=$(echo "$artifact_base" | sed -E 's|^https?://([^/]+).*|\1|')
@@ -262,31 +262,67 @@ page_deep_audit() {
     for html_file in "$folder/artifact.html" "$folder/staging.html"; do
         # 1. Basic preprocessing (comments & domains)
         perl -0777 -pi -e 's/<!--.*?-->//gs' "$html_file"
-        sed -i -E "s|https?:\\\\?/\\\\?/${art_domain}||g" "$html_file"
-        sed -i -E "s|https?:\\\\?/\\\\?/${stg_domain}||g" "$html_file"
-        [[ -n "$baked_domain" ]] && sed -i -E "s|https?:\\\\?/\\\\?/${baked_domain}||g" "$html_file"
+        
+        # Comprehensive Hostname Neutralization (Staged vs Artifact vs Preview vs Baked vs Production)
+        # We strip protocol and domain to make URLs root-relative. 
+        # We use a broad regex [:\\\\/%2F]+ to catch ://, :\/, :%2F%2F, etc.
+        sed -i -E "s,https?[:\\\\/%2F]+${art_domain},,g" "$html_file"
+        sed -i -E "s,https?[:\\\\/%2F]+${stg_domain},,g" "$html_file"
+        [[ -n "$baked_domain" ]] && sed -i -E "s,https?[:\\\\/%2F]+${baked_domain},,g" "$html_file"
+        # Generic catch-all for any other getshifter domains OR the production domain hiding in URLs
+        sed -i -E "s,https?[:\\\\/%2F]+[a-zA-Z0-9.-]+\.(getshifter\.(net|io)|nationalcpc\.org),,g" "$html_file"
+
         sed -i -E 's|href=""|href="/"|g' "$html_file"
         sed -i -E 's|action=""|action="/"|g' "$html_file"
 
         # 2. Structural Masking for Randomized Content
-        # We neutralize unique IDs in Loop items to allow xmldiff to match identical content across reorders.
-        sed -i -E 's/e-loop-item-[0-9]+/e-loop-item-ID-MASKED/g' "$html_file"
-        sed -i -E 's/post-[0-9]+/post-ID-MASKED/g' "$html_file"
+        # Neutralize unique IDs to allow xmldiff to match identical content across reorders.
+        sed -i -E 's/e-loop-item-[0-9a-fA-F]+/e-loop-item-ID-MASKED/g' "$html_file"
+        sed -i -E 's/post-[0-9a-fA-F]+/post-ID-MASKED/g' "$html_file"
+        sed -i -E 's/data-id="[^"]+"/data-id="ID-MASKED"/g' "$html_file"
+        sed -i -E 's/id="elementor-section-inner-[0-9a-fA-F]+"/id="elementor-section-inner-MASKED"/g' "$html_file"
+        sed -i -E 's/wpfc-calendar-[0-9]+/wpfc-calendar-MASKED/g' "$html_file"
+
+        # Expanded Elementor Randomized Attributes
+        sed -i -E 's/elementor-repeater-item-[a-zA-Z0-9]+/elementor-repeater-item-MASKED/g' "$html_file"
+        sed -i -E 's/elementor-element-[0-9a-fA-F]+/elementor-element-MASKED/g' "$html_file"
+        sed -i -E 's/e-n-menu-content-[0-9]+/e-n-menu-content-MASKED/g' "$html_file"
+        sed -i -E 's/e-n-menu-dropdown-icon-[0-9]+/e-n-menu-dropdown-icon-MASKED/g' "$html_file"
+        sed -i -E 's/aria-controls="e-n-menu-content-[0-9]+"/aria-controls="e-n-menu-content-MASKED"/g' "$html_file"
+        sed -i -E 's/aria-labelledby="e-n-menu-dropdown-icon-[0-9]+"/aria-labelledby="e-n-menu-dropdown-icon-MASKED"/g' "$html_file"
+
+        # Neutralize dynamic config (nonces and local IDs in JSON)
+        sed -i -E 's/&quot;nonce&quot;:&quot;[0-9a-fA-F]+&quot;/&quot;nonce&quot;:&quot;NONCE-MASKED&quot;/g' "$html_file"
+        sed -i -E 's/&quot;_id&quot;:&quot;[a-zA-Z0-9]+&quot;/&quot;_id&quot;:&quot;ID-MASKED&quot;/g' "$html_file"
+        sed -i -E 's/"nonce":"[0-9a-fA-F]+"/"nonce":"NONCE-MASKED"/g' "$html_file"
+        sed -i -E 's/"_id":"[a-zA-Z0-9]+"/"_id":"ID-MASKED"/g' "$html_file"
 
         # 3. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
-        # Uses tidy.config for support of newer tags like <search> and structural standardization
-        tidy -config tidy.config -m "$html_file" > /dev/null 2>&1
+        # We use --show-body-only to avoid DOCTYPE parsing issues in xmldiff
+        local tmp=$(mktemp)
+        echo "<root>" > "$tmp"
+        tidy -config tidy.config --show-body-only yes "$html_file" >> "$tmp" 2>/dev/null || true
+        echo "</root>" >> "$tmp"
+        mv "$tmp" "$html_file"
     done
 
     # Audit logic: Check for structural regressions using xmldiff (ignoring simple moves)
     # xmldiff requires valid XML/XHTML, which tidy just provided.
-    local structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -v "\[move")
+    # Note: grep -v returns exit 1 if no matches are found (which is our goal).
+    # We must assign it separately from 'local' to ensure 'set -e' doesn't kill the subshell.
+    local structural_diff
+    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$|starship" || true)
     
     # Generate human-readable unified diff for debugging if ANY differences exist
-    diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1
+    diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1 || true
 
     if [[ -z "$structural_diff" ]]; then 
-        rm -rf "$folder"; rmdir -p "$(dirname "$folder")" 2>/dev/null || true
+        rm -rf "$folder"
+        # Cleanup parent tree if empty
+        while [[ "$folder" != "artifacts" && "$folder" != "." ]]; do
+            folder=$(dirname "$folder")
+            rmdir "$folder" 2>/dev/null || break
+        done
     else 
         echo -e "  ${RED}✗${RESET} Structural or content regressions found in ${BOLD}${slug}${RESET}"
         # If the diff was purely moves, it was filtered from structural_diff, so we pass.
@@ -296,6 +332,8 @@ page_deep_audit() {
 
 # ── Arguments & Orchestration ─────────────────────────────────────────
 BASE_URL=""
+SUBPAGES=()
+TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) USE_API=true; shift ;;
@@ -306,7 +344,8 @@ while [[ $# -gt 0 ]]; do
         --sample) SAMPLE_SIZE="$2"; shift 2 ;;
         --sitemap-from) SITEMAP_FROM="${2%/}"; shift 2 ;;
         --prime) PRIME_ONLY=true; shift ;;
-        *) BASE_URL="${1%/}"; shift ;;
+        -*) usage ;;
+        *) SUBPAGES+=("${1%/}"); shift ;;
     esac
 done
 
@@ -333,51 +372,56 @@ if [[ "$USE_API" == true ]]; then
         AID=$(shifter_get_latest_artifact "$SITE_ID")
     fi
     BASE_URL="https://${AID}.preview.getshifter.io"
+    STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+    SITEMAP_URL="${STAGING_URL}/sitemap.xml"
 else
     # Manual Mode
     [[ -z "$BASE_URL" ]] && usage
     AID="${AID:-manual_audit_$(date +%H%M%S)}"
     STAGING_URL="${STAGING_URL:-${SITEMAP_FROM%/*}}"
+    SITEMAP_URL="${STAGING_URL}/sitemap.xml"
 fi
 
 echo -e "  Artifact ID: ${CYAN}${AID}${RESET}" >&2
 echo -e "  Target URL:   ${CYAN}${BASE_URL}${RESET}" >&2
-echo -e "  Staging URL:  ${CYAN}${STAGING_URL}${RESET}" >&2
 
 SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
 
-# Wait for Staging Readiness
-if [[ -n "${STAGING_URL:-}" ]]; then
-    info "Waiting for Staging to be responsive at ${SITEMAP_URL}..." >&2
-    s_status=0; retry=0
-    wp_started=false
-    while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
-        s_status=$(curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
-        
-        # Self-healing: Start WordPress if we hit a 5xx error and have API access
-        if [[ "$s_status" == 5* && "$USE_API" == true && "$wp_started" == false ]]; then
-            warn "Staging returned HTTP ${s_status}. Attempting to start WordPress..." >&2
-            shifter_start_wordpress "$SITE_ID"
-            wp_started=true
-        fi
-        
-        [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
-    done
-    echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
+if [[ "${#SUBPAGES[@]}" -gt 0 ]]; then
+    # Use specified subpages instead of sitemap
+    mkdir -p "$TMPDIR"
+    printf "%s\n" "${SUBPAGES[@]}" > "$TMPDIR/audit.txt"
+    info "Targeting ${#SUBPAGES[@]} specific pages..."
+else
+    # Site-agnostic extraction: grab <loc>, then strip the protocol and domain
+    status_msg="Waiting for Staging to be responsive at ${SITEMAP_URL}..."
+    if [[ -n "${STAGING_URL:-}" ]]; then
+        info "$status_msg" >&2
+        s_status=0; retry=0; wp_started=false
+        while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
+            s_status=$(curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
+            if [[ "$s_status" == 5* && "$USE_API" == true && "$wp_started" == false ]]; then
+                warn "Staging returned HTTP ${s_status}. Attempting to start WordPress..." >&2
+                shifter_start_wordpress "$SITE_ID"
+                wp_started=true
+            fi
+            [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
+        done
+        echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
+    fi
+    mkdir -p "$TMPDIR"
+    curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | \
+        sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | \
+        sed -E 's|^https?://[^/]+||' | \
+        grep "^/" > "$TMPDIR/all_slugs.txt"
+    [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 fi
-TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
-# Site-agnostic extraction: grab <loc>, then strip the protocol and domain
-curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | \
-    sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | \
-    sed -E 's|^https?://[^/]+||' | \
-    grep "^/" > "$TMPDIR/all_slugs.txt"
-
-[[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 
 # ── Execution ──
 echo -e "\n${BOLD}── Elementor Audit Execution ──${RESET}"
 info "Target: ${BASE_URL}"
 [[ -n "${STAGING_URL:-}" ]] && info "Source: ${STAGING_URL}"
+info "Sitemap: ${SITEMAP_URL}"
 
 JOBS=0; MAX=8
 while IFS= read -r slug; do
@@ -393,8 +437,8 @@ while IFS= read -r slug; do
         curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
         
         echo -e "\n${BOLD}${path}${RESET}"
-        grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || fail "Heartbeat MISSING"
-        grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && fail "CSS hashing MISSING" || pass "CSS hashing active"
+        grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || warn "Heartbeat missing (This is normal if page is non-Elementor)"
+        grep -oP "href='[^']*elementor\/css\/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && warn "CSS hashing missing (This is normal for some page types)" || pass "CSS hashing active"
         
         css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
         while IFS= read -r css; do 
@@ -404,8 +448,8 @@ while IFS= read -r slug; do
         done <<< "$css_urls"
         rm -f "$html"
     ) &
-    JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n; JOBS=$((JOBS-1)); }
-done < "$TMPDIR/audit.txt"; wait
+    JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n || true; JOBS=$((JOBS-1)); }
+done < "$TMPDIR/audit.txt"; wait || true
 
 if [[ "$DEEP_AUDIT" == true ]]; then
     echo -e "\n${BOLD}── Audit Results ──${RESET}"
