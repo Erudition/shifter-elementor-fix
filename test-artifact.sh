@@ -311,13 +311,14 @@ page_deep_audit() {
     # Note: grep -v returns exit 1 if no matches are found (which is our goal).
     # We must assign it separately from 'local' to ensure 'set -e' doesn't kill the subshell.
     local structural_diff
-    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$|starship" || true)
+    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -i -v "\[move|^$|starship" | tr -d '[:space:]' || true)
     
     # Generate human-readable unified diff for debugging if ANY differences exist
     diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1 || true
 
     if [[ -z "$structural_diff" ]]; then 
         rm -rf "$folder"
+        [[ "$DEEP_AUDIT" == true ]] && echo -e "  ${GREEN}✓${RESET} No regressions found in ${BOLD}${slug}${RESET} (cleaned up)"
         # Cleanup parent tree if empty
         while [[ "$folder" != "artifacts" && "$folder" != "." ]]; do
             folder=$(dirname "$folder")
