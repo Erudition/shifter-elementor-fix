@@ -38,7 +38,7 @@ SITE_ID=""
 ACCESS_TOKEN=""
 DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e" # NCPC
 ENV_FILE="$(dirname "$0")/.env"
-ARTIFACTS_DIR="$(dirname "$0")/.artifacts"
+ARTIFACTS_DIR="$(dirname "$0")/artifacts"
 
 declare -A ELEMENTOR_VERSIONS=()
 declare -a FAILED_PAGES=()
@@ -313,6 +313,10 @@ done
 if [[ "$USE_API" == true ]]; then
     shifter_login; SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
     STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+    AID=$(shifter_list_artifacts "$SITE_ID" | jq -r '.items[0].id')
+fi
+AID="${AID:-manual_audit_$(date +%H%M%S)}"
+echo -e "  Artifact ID: ${CYAN}${AID}${RESET}" >&2
 if [[ "$DO_BAKE" == true ]]; then
         # Check if a bake is already in progress to latch onto it
         LATEST_DATA=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
