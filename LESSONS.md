@@ -51,3 +51,8 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Symptom**: Attempting to audit or view the `.preview.getshifter.io` URL immediately after a bake often results in a **403 Forbidden** error.
 *   **The Lesson**: The preview environment is created on-demand. To make it accessible to the audit script, it must be "Launch"ed—typically by clicking the 'Preview' button in the Shifter Dashboard.
 *   **The Rule**: If the audit tool reports a 403, verify that the artifact has been provisioned in the dashboard.
+
+## 12. Mandatory Trailing Slashes
+*   **The Issue**: Shifter's static architecture (folders containing `index.html`) relies on the trailing slash for correct CloudFront resolution.
+*   **The Symptom**: Accessing a directory path without a trailing slash (e.g., `/course/awr-136`) often results in a **403 Forbidden** (LambdaGeneratedResponse) from CloudFront, or an incorrect redirect to an internal staging URL.
+*   **The Rule**: Always append a trailing slash to all internal URLs. The audit tool is now configured to enforce this on all discovered slugs.

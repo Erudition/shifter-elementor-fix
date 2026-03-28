@@ -144,11 +144,12 @@ shifter_get_latest_artifact() {
     local status=$(echo "$artifact_data" | jq -r '.status')
     echo -e "  Latest:   ${CYAN}${id}${RESET}" >&2
     echo -e "  Status:   ${BOLD}${status}${RESET}" >&2
-    while [[ "$status" == "increation" ]]; do
-        echo -ne "  ${YELLOW}⌛ Generation in progress... Waiting 30s...\r${RESET}" >&2; sleep 30
+    if [[ "$status" == "increation" ]]; then
+        shifter_wait_for_bake "$site_id" "$id"
+        # Refresh status after wait
         artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$id\")")
         status=$(echo "$artifact_data" | jq -r '.status')
-    done
+    fi
     [[ "$status" == "ready" || "$status" == "published-shifter" ]] && { echo -e "  ${GREEN}✓${RESET} Artifact is ready" >&2; echo "$id"; } || { echo -e "${RED}Error: Artifact failed.${RESET}" >&2; exit 1; }
 }
 
@@ -243,11 +244,20 @@ shifter_launch_preview() {
 # ── Regression Engine Logic ──────────────────────────────────────────
 page_deep_audit() {
     local slug="$1"; local artifact_base="$2"; local staging_base="$3"; local aid="$4"
-    local safe_s="${slug#/}"; [[ -z "$safe_s" ]] && safe_s="homepage"
+    # Enforce trailing slash
+    [[ "$slug" != */ ]] && slug="${slug}/"
+    local safe_s="${slug%/}"; safe_s="${safe_s#/}"
+    [[ -z "$safe_s" ]] && safe_s="homepage"
     local folder="$ARTIFACTS_DIR/$aid/$safe_s"; mkdir -p "$folder"
     curl -s -L -o "$folder/artifact.html" "${artifact_base}${slug}"
     curl -s -L -o "$folder/staging.html" "${staging_base}${slug}"
-    if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt"; then rm -rf "$folder"; else echo -e "  ${RED}✗${RESET} Differences found in ${BOLD}${slug}${RESET}"; fi
+    
+    # Audit logic
+    if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1; then 
+        rm -rf "$folder"; 
+    else 
+        echo -e "  ${RED}✗${RESET} Differences found in ${BOLD}${slug}${RESET}"
+    fi
 }
 
 # ── Arguments & Orchestration ─────────────────────────────────────────
@@ -269,9 +279,17 @@ done
 if [[ "$USE_API" == true ]]; then
     shifter_login; SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
     STAGING_URL="https://${SITE_ID}.static.getshifter.net"
-    if [[ "$DO_BAKE" == true ]]; then
-        shifter_stop_wordpress "$SITE_ID"
-        AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
+if [[ "$DO_BAKE" == true ]]; then
+        # Check if a bake is already in progress to latch onto it
+        LATEST_DATA=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
+        LATEST_STATUS=$(echo "$LATEST_DATA" | jq -r '.status')
+        if [[ "$LATEST_STATUS" == "increation" ]]; then
+            AID=$(echo "$LATEST_DATA" | jq -r '.artifact_id')
+            info "Latching onto existing bake: ${CYAN}${AID}${RESET}..." >&2
+        else
+            shifter_stop_wordpress "$SITE_ID"
+            AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
+        fi
         shifter_wait_for_bake "$SITE_ID" "$AID"
         shifter_launch_preview "$SITE_ID" "$AID"
         shifter_start_wordpress "$SITE_ID"
