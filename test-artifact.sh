@@ -188,11 +188,16 @@ shifter_start_bake() {
     local site_id="$1"
     local title="${2:-$BAKE_NAME}"
     info "Starting new Bake: ${BOLD}${title}${RESET} (Generating Artifact)..." >&2
+    
+    # Use jq to build the JSON body safely with multiple potential naming fields
+    local body=$(jq -n --arg t "$title" '{"title": $t, "artifact_alias": $t, "comment": $t}')
+    
     local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" \
         -X POST \
         -H "Content-Type: application/json" \
         -H "Authorization: ${ACCESS_TOKEN}" \
-        -d "{\"title\":\"$title\"}" | jq -r '.artifact_id')
+        -d "$body" | jq -r '.artifact_id')
+        
     [[ -z "$aid" || "$aid" == "null" ]] && { echo -e "${RED}Error: Failed to start bake.${RESET}" >&2; exit 1; }
     echo "$aid"
 }
