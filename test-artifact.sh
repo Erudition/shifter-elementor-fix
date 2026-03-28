@@ -307,8 +307,17 @@ SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
 if [[ -n "${STAGING_URL:-}" ]]; then
     info "Waiting for Staging to be responsive at ${SITEMAP_URL}..." >&2
     s_status=0; retry=0
+    wp_started=false
     while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
         s_status=$(curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
+        
+        # Self-healing: Start WordPress if we hit a 5xx error and have API access
+        if [[ "$s_status" == 5* && "$USE_API" == true && "$wp_started" == false ]]; then
+            warn "Staging returned HTTP ${s_status}. Attempting to start WordPress..." >&2
+            shifter_start_wordpress "$SITE_ID"
+            wp_started=true
+        fi
+        
         [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
     done
     [[ "$s_status" != "200" ]] && { echo -e "\n${RED}Error: Staging sitemap unreachable.${RESET}" >&2; exit 1; }
