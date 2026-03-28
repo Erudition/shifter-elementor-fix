@@ -268,7 +268,12 @@ page_deep_audit() {
         sed -i -E 's|href=""|href="/"|g' "$html_file"
         sed -i -E 's|action=""|action="/"|g' "$html_file"
 
-        # 2. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
+        # 2. Structural Masking for Randomized Content
+        # We neutralize unique IDs in Loop items to allow xmldiff to match identical content across reorders.
+        sed -i -E 's/e-loop-item-[0-9]+/e-loop-item-ID-MASKED/g' "$html_file"
+        sed -i -E 's/post-[0-9]+/post-ID-MASKED/g' "$html_file"
+
+        # 3. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
         # Uses tidy.config for support of newer tags like <search> and structural standardization
         tidy -config tidy.config -m "$html_file" > /dev/null 2>&1
     done
