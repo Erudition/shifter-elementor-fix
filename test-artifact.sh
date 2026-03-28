@@ -126,7 +126,9 @@ shifter_login() {
         echo -ne "  Username: " >&2; read -r user
         echo -ne "  Password: " >&2; read -rs pass; echo "" >&2
     fi
-    local response=$(curl -s https://api.getshifter.io/latest/login -X POST -d "{\"username\":\"$user\", \"password\":\"$pass\"}")
+    local response=$(curl -s https://api.getshifter.io/latest/login -X POST \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"$user\", \"password\":\"$pass\"}")
     ACCESS_TOKEN=$(echo "$response" | jq -r '.AccessToken // empty')
     if [[ -z "$ACCESS_TOKEN" ]]; then echo -e "${RED}Error: Shifter API Login failed.${RESET}" >&2; exit 1; fi
     save_token_to_env "$ACCESS_TOKEN"
@@ -187,7 +189,10 @@ shifter_start_bake() {
     local title="${2:-$BAKE_NAME}"
     info "Starting new Bake: ${BOLD}${title}${RESET} (Generating Artifact)..." >&2
     local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" \
-        -X POST -d "{\"title\":\"$title\"}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
+        -X POST \
+        -H "Content-Type: application/json" \
+        -H "Authorization: ${ACCESS_TOKEN}" \
+        -d "{\"title\":\"$title\"}" | jq -r '.artifact_id')
     [[ -z "$aid" || "$aid" == "null" ]] && { echo -e "${RED}Error: Failed to start bake.${RESET}" >&2; exit 1; }
     echo "$aid"
 }
