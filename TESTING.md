@@ -16,11 +16,13 @@ Triggering a full cycle:
 
 ### 2. Side-by-Side Diffing (`--deep-audit`)
 In this mode, the script downloads matching pages from both environments and stores them in:
-`.artifacts/<artifact_id>/<page-slug>/`
+`artifacts/<artifact_id>/<page-slug>/`
 
 -   **Parallel Workers**: Uses up to 8 concurrent processes to speed up comparison.
--   **Automated Cleanup**: If the pages are identical, the folder is deleted.
--   **Reviewing Issues**: If `diff.txt` exists for a slug, it means there is an HTML discrepancy (e.g., stale content or structural generation errors).
+-   **Structural Normalization**: Uses `tidy-html` to standardize HTML structure and `python-xmldiff` to perform tree-based comparison.
+-   **Benign Ignorance**: Automatically masks randomized Elementor Loop item IDs (`e-loop-item-ID-MASKED`) and `post-ID` attributes to ignore content reordering while flagging actual structural regressions.
+-   **Automated Cleanup**: If the pages are structurally identical (ignoring "move" operations), the folder is deleted.
+-   **Reviewing Issues**: If a folder remains under `artifacts/AID/`, it means a structural discrepancy was found. Check `diff.txt` for the specific tree changes.
 
 ## Security & Environment Configuration
 
@@ -45,4 +47,6 @@ SHIFTER_ACCESS_TOKEN="eyJraW..."
 ## Requirements
 *   `jq`: Required for Shifter API and JWT parsing.
 *   `curl`: Required for network requests.
+*   `tidy-html`: Required for HTML normalization (`tidy`).
+*   `python-xmldiff`: Required for structural tree diffing (`xmldiff`).
 *   `base64`: Required for token validation.

@@ -61,3 +61,11 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Symptom**: `curl` requests for assets return **403 Forbidden** (LambdaGeneratedResponse), while the same assets load correctly in a browser. HTML pages (`text/html`) are usually exempt.
 *   **The Solution**: All `curl` requests for assets on the preview domain **MUST** include a `Referer` header matching the base preview URL (e.g., `-H "Referer: https://[AID].preview.getshifter.io/"`).
 *   **The Rule**: Never attempt to audit or scrape Shifter preview assets with `curl` without the local `Referer` header.
+## 14. High-Fidelity Structural Regression Engine
+*   **The Issue**: Elementor randomizes certain IDs (e.g., `e-loop-item-XXXX`) and `post-XXXX` id attributes on every render.
+*   **The Pitfall**: Simple text-based diffing or bitwise comparison triggers regression alerts for every render, even if the layout is identical. This makes automated auditing noisy and unreliable.
+*   **The Solution**: Move beyond flat-file diffing to **Structural Tree Comparison**:
+    1.  **Normalization (`tidy`)**: Convert fragmented HTML into valid, standardized XHTML5.
+    2.  **Structural Masking (`sed`)**: Replace randomized numeric IDs with a generic `ID-MASKED` token before the comparison phase.
+    3.  **Hhigh-Fidelity Diff (`xmldiff`)**: Perform a tree-based comparison that ignores "move" operations (reordering of identical nodes) while flagging actual node name, attribute, or text content changes.
+*   **The Result**: The engine now correctly prunes identical pages even if IDs have shifted, providing high-confidence regression signatures.

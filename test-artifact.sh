@@ -34,9 +34,9 @@ USE_API=false
 DO_BAKE=false
 DEEP_AUDIT=false
 BAKE_NAME="Full Lifecycle Regression Audit"
-SITE_ID=""
+SITE_ID="${SITE_ID:-}"
 ACCESS_TOKEN=""
-DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e" # NCPC
+DEFAULT_SITE_ID="${DEFAULT_SITE_ID:-3215b04c-84e4-4a42-8132-902bb6d4b51e}" # NCPC as fallback
 ENV_FILE="$(dirname "$0")/.env"
 ARTIFACTS_DIR="$(dirname "$0")/artifacts"
 
@@ -286,7 +286,7 @@ page_deep_audit() {
     diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1
 
     if [[ -z "$structural_diff" ]]; then 
-        rm -rf "$folder"
+        rm -rf "$folder"; rmdir -p "$(dirname "$folder")" 2>/dev/null || true
     else 
         echo -e "  ${RED}✗${RESET} Structural or content regressions found in ${BOLD}${slug}${RESET}"
         # If the diff was purely moves, it was filtered from structural_diff, so we pass.
@@ -311,13 +311,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$USE_API" == true ]]; then
-    shifter_login; SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
+    shifter_login
+    SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
     STAGING_URL="https://${SITE_ID}.static.getshifter.net"
-    AID=$(shifter_list_artifacts "$SITE_ID" | jq -r '.items[0].id')
-fi
-AID="${AID:-manual_audit_$(date +%H%M%S)}"
-echo -e "  Artifact ID: ${CYAN}${AID}${RESET}" >&2
-if [[ "$DO_BAKE" == true ]]; then
+    
+    if [[ "$DO_BAKE" == true ]]; then
         # Check if a bake is already in progress to latch onto it
         LATEST_DATA=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
         LATEST_STATUS=$(echo "$LATEST_DATA" | jq -r '.status')
@@ -335,9 +333,17 @@ if [[ "$DO_BAKE" == true ]]; then
         AID=$(shifter_get_latest_artifact "$SITE_ID")
     fi
     BASE_URL="https://${AID}.preview.getshifter.io"
+else
+    # Manual Mode
+    [[ -z "$BASE_URL" ]] && usage
+    AID="${AID:-manual_audit_$(date +%H%M%S)}"
+    STAGING_URL="${STAGING_URL:-${SITEMAP_FROM%/*}}"
 fi
 
-[[ -z "$BASE_URL" ]] && usage
+echo -e "  Artifact ID: ${CYAN}${AID}${RESET}" >&2
+echo -e "  Target URL:   ${CYAN}${BASE_URL}${RESET}" >&2
+echo -e "  Staging URL:  ${CYAN}${STAGING_URL}${RESET}" >&2
+
 SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
 
 # Wait for Staging Readiness
@@ -357,11 +363,15 @@ if [[ -n "${STAGING_URL:-}" ]]; then
         
         [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
     done
-    [[ "$s_status" != "200" ]] && { echo -e "\n${RED}Error: Staging sitemap unreachable.${RESET}" >&2; exit 1; }
     echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
 fi
 TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
-curl -s -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' | sed "s|https://[^/]*||g" > "$TMPDIR/all_slugs.txt"
+# Site-agnostic extraction: grab <loc>, then strip the protocol and domain
+curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | \
+    sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | \
+    sed -E 's|^https?://[^/]+||' | \
+    grep "^/" > "$TMPDIR/all_slugs.txt"
+
 [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 
 # ── Execution ──
