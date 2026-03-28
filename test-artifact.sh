@@ -266,11 +266,11 @@ page_deep_audit() {
         # Comprehensive Hostname Neutralization (Staged vs Artifact vs Preview vs Baked vs Production)
         # We strip protocol and domain to make URLs root-relative. 
         # We use a broad regex [:\\\\/%2F]+ to catch ://, :\/, :%2F%2F, etc.
-        sed -i -E "s,https?[:\\\\/%2F]+${art_domain},,g" "$html_file"
-        sed -i -E "s,https?[:\\\\/%2F]+${stg_domain},,g" "$html_file"
-        [[ -n "$baked_domain" ]] && sed -i -E "s,https?[:\\\\/%2F]+${baked_domain},,g" "$html_file"
-        # Generic catch-all for any other getshifter domains OR the production domain hiding in URLs
-        sed -i -E "s,https?[:\\\\/%2F]+[a-zA-Z0-9.-]+\.(getshifter\.(net|io)|nationalcpc\.org),,g" "$html_file"
+        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${art_domain},,g" "$html_file"
+        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${stg_domain},,g" "$html_file"
+        [[ -n "$baked_domain" ]] && sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${baked_domain},,g" "$html_file"
+        # Generic catch-all for any other getshifter domains hiding in URLs
+        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+[a-zA-Z0-9.-]+\.getshifter\.(net|io),,g" "$html_file"
 
         sed -i -E 's|href=""|href="/"|g' "$html_file"
         sed -i -E 's|action=""|action="/"|g' "$html_file"
@@ -413,7 +413,7 @@ else
     curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | \
         sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | \
         sed -E 's|^https?://[^/]+||' | \
-        grep "^/" > "$TMPDIR/all_slugs.txt"
+        grep "^/" | grep -v "#" > "$TMPDIR/all_slugs.txt"
     [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 fi
 
