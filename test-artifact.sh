@@ -72,7 +72,12 @@ load_env() {
             [[ "$line" =~ ^#.* ]] && continue
             [[ -z "$line" ]] && continue
             if [[ "$line" == *"="* ]]; then
-                export "$line"
+                local key="${line%%=*}"
+                local value="${line#*=}"
+                # Strip leading/trailing quotes
+                value="${value%\"}"; value="${value#\"}"
+                value="${value%\'}"; value="${value#\'}"
+                export "$key=$value"
             fi
         done < "$ENV_FILE"
     fi
