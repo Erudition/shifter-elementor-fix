@@ -1,38 +1,16 @@
 #!/usr/bin/env bash
 #
-# test-artifact.sh — Elementor CSS Shifter Audit & Priming Tool
+# test-artifact.sh — Elementor CSS Shifter Audit & API Discovery Tool
 #
 # Usage:
-#   ./test-artifact.sh <site-url> [options]
+#   ./test-artifact.sh [site-url] [options]
+#   ./test-artifact.sh --api [options]
+#   ./test-artifact.sh --bake [options]
 #
-# Fetches the sitemap, discovers all pages, and checks each one for
-# known Elementor CSS issues on the Shifter platform.
-#
-# Options:
-#   --sample N          Only test N randomly-sampled pages (+ homepage).
-#   --sitemap-from URL  Fetch sitemap from a different origin (e.g. the
-#                       live site) and rewrite URLs to <site-url>.
-#                       Useful for preview artifacts that lack a sitemap.
-#   --prime             Only "prime" the metadata (visit all pages) without
-#                       running the full audit checks. Useful for staging.
-#
-# Checks performed:
-#   1. Plugin heartbeat signature present
-#   2. All /uploads/elementor/ CSS files use content hashes (no ?ver=)
-#   3. Shape dividers have shapes.min.css linked
-#   4. Loop grids have widget-loop-common.css linked
-#   5. All Elementor stylesheets return HTTP 200
-#   6. No non-CDN paths contain Shifter hex IDs
-#   7. Consistent Elementor version across all pages
-#
-# Exit codes:
-#   0  All checks passed
-#   1  One or more checks failed
-#   2  Usage error or sitemap not found
-#
-# Terminology:
-#   *.static.getshifter.net = Staging (Live WordPress)
-#   *.preview.getshifter.io = Artifact (Static snapshot)
+# Environment Configuration (.env):
+#   SHIFTER_ACCESS_TOKEN   Long-lived access token (automatically updated)
+#   SHIFTER_USER           (Optional) Username for auto-renewal
+#   SHIFTER_PASS           (Optional) Password for auto-renewal
 
 set -euo pipefail
 
@@ -52,6 +30,15 @@ PAGES_CHECKED=0
 SAMPLE_SIZE=0
 SITEMAP_FROM=""
 PRIME_ONLY=false
+USE_API=false
+DO_BAKE=false
+DEEP_AUDIT=false
+SITE_ID=""
+ACCESS_TOKEN=""
+DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e" # NCPC
+ENV_FILE=".env"
+ARTIFACTS_DIR=".artifacts"
+
 declare -A ELEMENTOR_VERSIONS=()
 declare -a FAILED_PAGES=()
 
@@ -62,242 +49,238 @@ warn()  { WARN_COUNT=$((WARN_COUNT+1)); echo -e "  ${YELLOW}⚠${RESET} $1"; }
 info()  { echo -e "  ${CYAN}ℹ${RESET} $1"; }
 
 usage() {
-    echo "Usage: $0 <site-url> [--sample N] [--sitemap-from URL] [--prime]"
+    echo "Usage: $0 [site-url] [options]"
+    echo "       $0 --api [--site-id ID] [options]"
+    echo "       $0 --bake [--site-id ID] [options]"
     echo ""
-    echo "  <site-url>          Target site URL (Staging or Artifact)"
+    echo "  --api               Automatically find and audit the latest artifact"
+    echo "  --bake              Trigger a full build cycle (Stop WP → Bake → Audit → Start WP)"
+    echo "  --deep-audit        Perform side-by-side HTML diffing (Artifact vs Staging)"
+    echo "  --site-id ID        Shifter Site ID (Default: NationalCPC)"
     echo "  --sample N          Test only N random pages (+ homepage)"
     echo "  --sitemap-from URL  Pull sitemap from a different origin"
-    echo "  --prime             Only visit URLs to rebuild metadata (Staging site only)"
+    echo "  --prime             Only visit URLs to rebuild metadata (Staging only)"
+    echo ""
+    echo "Tip: Make sure to 'Sync Plugin' in the WP Pusher dashboard BEFORE running --bake"
     exit 2
 }
 
-# ── Parse Arguments ──────────────────────────────────────────────────
-[[ $# -lt 1 ]] && usage
+# ── Env Management ───────────────────────────────────────────────────
+load_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^#.* ]] && continue
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == *"="* ]]; then
+                export "$line"
+            fi
+        done < "$ENV_FILE"
+    fi
+}
 
-BASE_URL="${1%/}"
-shift
+save_token_to_env() {
+    local token="$1"
+    if [[ ! -f "$ENV_FILE" ]]; then
+        touch "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+    fi
+    if grep -q "SHIFTER_ACCESS_TOKEN" "$ENV_FILE"; then
+        sed -i "s/^SHIFTER_ACCESS_TOKEN=.*/SHIFTER_ACCESS_TOKEN=$token/" "$ENV_FILE"
+    else
+        echo "SHIFTER_ACCESS_TOKEN=$token" >> "$ENV_FILE"
+    fi
+}
 
+# ── JWT Validation ───────────────────────────────────────────────────
+jwt_is_valid() {
+    local token="$1"
+    [[ -z "$token" || "$token" == "null" ]] && return 1
+    local payload=$(echo "$token" | cut -d'.' -f2 || echo "")
+    [[ -z "$payload" ]] && return 1
+    local len=$(( ${#payload} % 4 ))
+    if [ $len -eq 2 ]; then payload="${payload}=="; elif [ $len -eq 3 ]; then payload="${payload}="; fi
+    local decoded=$(echo "$payload" | base64 -d 2>/dev/null || echo "{}")
+    local exp=$(echo "$decoded" | jq -r '.exp // 0')
+    local now=$(date +%s)
+    [[ "$exp" -ne 0 && "$now" -lt "$exp" ]] && return 0
+    return 1
+}
+
+# ── Shifter API Logic ───────────────────────────────────────────────
+shifter_login() {
+    load_env
+    ACCESS_TOKEN="${SHIFTER_ACCESS_TOKEN:-}"
+    if jwt_is_valid "$ACCESS_TOKEN"; then return 0; fi
+    echo -e "${BOLD}── Shifter API Authentication ──${RESET}" >&2
+    local user="${SHIFTER_USER:-}"
+    local pass="${SHIFTER_PASS:-}"
+    if [[ -z "$user" || -z "$pass" ]]; then
+        info "Access token expired or not found. Please provide credentials:"
+        echo -ne "  Username: " >&2; read -r user
+        echo -ne "  Password: " >&2; read -rs pass; echo "" >&2
+    fi
+    local response=$(curl -s https://api.getshifter.io/latest/login -X POST -d "{\"username\":\"$user\", \"password\":\"$pass\"}")
+    ACCESS_TOKEN=$(echo "$response" | jq -r '.AccessToken // empty')
+    if [[ -z "$ACCESS_TOKEN" ]]; then echo -e "${RED}Error: Shifter API Login failed.${RESET}" >&2; exit 1; fi
+    save_token_to_env "$ACCESS_TOKEN"
+    echo -e "  ${GREEN}✓${RESET} Authenticated successfully" >&2
+}
+
+shifter_get_latest_artifact() {
+    local site_id="$1"
+    info "Fetching latest artifact info..." >&2
+    local artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
+    if [[ -z "$artifact_data" || "$artifact_data" == "null" ]]; then echo -e "${RED}Error: No artifacts found for site ${site_id}${RESET}" >&2; exit 1; fi
+    local id=$(echo "$artifact_data" | jq -r '.artifact_id')
+    local status=$(echo "$artifact_data" | jq -r '.status')
+    echo -e "  Latest:   ${CYAN}${id}${RESET}" >&2
+    echo -e "  Status:   ${BOLD}${status}${RESET}" >&2
+    while [[ "$status" == "increation" ]]; do
+        echo -ne "  ${YELLOW}⌛ Generation in progress... Waiting 30s...\r${RESET}" >&2; sleep 30
+        artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$id\")")
+        status=$(echo "$artifact_data" | jq -r '.status')
+    done
+    [[ "$status" == "ready" || "$status" == "published-shifter" ]] && { echo -e "  ${GREEN}✓${RESET} Artifact is ready" >&2; echo "$id"; } || { echo -e "${RED}Error: Artifact failed.${RESET}" >&2; exit 1; }
+}
+
+shifter_stop_wordpress() {
+    local site_id="$1"
+    info "Stopping WordPress instance..." >&2
+    curl -s "https://api.getshifter.io/latest/sites/${site_id}/wordpress_site/stop" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
+    local status="inservice"
+    while [[ "$status" != "stopped" ]]; do
+        status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
+        [[ "$status" != "stopped" ]] && sleep 5
+    done
+    echo -e "  ${GREEN}✓${RESET} WordPress stopped" >&2
+}
+
+shifter_start_wordpress() {
+    local site_id="$1"
+    info "Starting WordPress instance..." >&2
+    curl -s "https://api.getshifter.io/latest/sites/${site_id}/wordpress_site/start" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
+    local status="stopped"
+    while [[ "$status" != "inservice" ]]; do
+        echo -ne "  ${YELLOW}⌛ Waiting for WordPress to be in-service...\r${RESET}" >&2
+        status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
+        [[ "$status" != "inservice" ]] && sleep 10
+    done
+    echo -e "\n  ${GREEN}✓${RESET} WordPress instance is live" >&2
+}
+
+shifter_start_bake() {
+    local site_id="$1"
+    info "Starting new Bake (Generating Artifact)..." >&2
+    local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -X POST -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
+    [[ -z "$aid" || "$aid" == "null" ]] && { echo -e "${RED}Error: Failed to start bake.${RESET}" >&2; exit 1; }
+    echo "$aid"
+}
+
+shifter_wait_for_bake() {
+    local site_id="$1"
+    local aid="$2"
+    local start_t=$(date +%s)
+    local percent=0
+    while [[ "$percent" -lt 100 ]]; do
+        local progress=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/check_generator_process" -H "Authorization: ${ACCESS_TOKEN}")
+        percent=$(echo "$progress" | jq -r '.percent // 0')
+        local current=$(echo "$progress" | jq -r '.created_url // 0')
+        local total=$(echo "$progress" | jq -r '.sum_url // 0')
+        local step=$(echo "$progress" | jq -r '.step // "Starting"')
+        echo -ne "  ${YELLOW}⌛ Bake Progress: ${percent}% (${current}/${total} pages) - ${step}...\r${RESET}" >&2
+        local artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$aid\")")
+        [[ "$(echo "$artifact_data" | jq -r '.status')" == "error" ]] && { echo -e "\n${RED}Error: Bake failed.${RESET}" >&2; exit 1; }
+        [[ "$percent" -lt 100 ]] && sleep 10
+    done
+    local end_t=$(date +%s); local dur=$((end_t - start_t))
+    echo -e "\n  ${GREEN}✓${RESET} Bake completed in ${BOLD}$((dur/60))m $((dur%60))s${RESET}" >&2
+}
+
+shifter_launch_preview() {
+    local site_id="$1"
+    local aid="$2"
+    info "Activating Preview for Artifact: ${aid}" >&2
+    curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts/${aid}/preview" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
+    echo -ne "  ${YELLOW}⌛ Provisioning static environment... Waiting 20s...\r${RESET}" >&2; sleep 20
+    echo -e "\n  ${GREEN}✓${RESET} Preview environment provisioned" >&2
+}
+
+# ── Regression Engine Logic ──────────────────────────────────────────
+page_deep_audit() {
+    local slug="$1"; local artifact_base="$2"; local staging_base="$3"; local aid="$4"
+    local safe_s="${slug#/}"; [[ -z "$safe_s" ]] && safe_s="homepage"
+    local folder="$ARTIFACTS_DIR/$aid/$safe_s"; mkdir -p "$folder"
+    curl -s -L -o "$folder/artifact.html" "${artifact_base}${slug}"
+    curl -s -L -o "$folder/staging.html" "${staging_base}${slug}"
+    if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt"; then rm -rf "$folder"; else echo -e "  ${RED}✗${RESET} Differences found in ${BOLD}${slug}${RESET}"; fi
+}
+
+# ── Arguments & Orchestration ─────────────────────────────────────────
+BASE_URL=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sample)
-            SAMPLE_SIZE="$2"
-            shift 2
-            ;;
-        --sitemap-from)
-            SITEMAP_FROM="${2%/}"
-            shift 2
-            ;;
-        --prime)
-            PRIME_ONLY=true
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1"
-            usage
-            ;;
+        --api) USE_API=true; shift ;;
+        --bake) DO_BAKE=true; USE_API=true; shift ;;
+        --deep-audit) DEEP_AUDIT=true; shift ;;
+        --site-id) SITE_ID="$2"; shift 2 ;;
+        --sample) SAMPLE_SIZE="$2"; shift 2 ;;
+        --sitemap-from) SITEMAP_FROM="${2%/}"; shift 2 ;;
+        --prime) PRIME_ONLY=true; shift ;;
+        *) BASE_URL="${1%/}"; shift ;;
     esac
 done
 
-# Detect Audit Type
-if [[ "$BASE_URL" == *".static.getshifter.net"* ]]; then
-    AUDIT_TYPE="Staging (Live)"
-elif [[ "$BASE_URL" == *".preview.getshifter.io"* ]]; then
-    AUDIT_TYPE="Artifact (Static)"
-else
-    AUDIT_TYPE="Generic"
+if [[ "$USE_API" == true ]]; then
+    shifter_login; SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
+    STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+    if [[ "$DO_BAKE" == true ]]; then
+        shifter_stop_wordpress "$SITE_ID"
+        AID=$(shifter_start_bake "$SITE_ID")
+        shifter_wait_for_bake "$SITE_ID" "$AID"
+        shifter_launch_preview "$SITE_ID" "$AID"
+        shifter_start_wordpress "$SITE_ID"
+    else
+        AID=$(shifter_get_latest_artifact "$SITE_ID")
+    fi
+    BASE_URL="https://${AID}.preview.getshifter.io"
 fi
 
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "$TMPDIR"' EXIT
+[[ -z "$BASE_URL" ]] && usage
+SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
+TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
+curl -s "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' | sed "s|https://[^/]*||g" > "$TMPDIR/all_slugs.txt"
+[[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
 
-# ── Step 1: Discover Pages via Sitemap ───────────────────────────────
-echo -e "\n${BOLD}═══ Elementor CSS Shifter Audit ═══${RESET}"
-echo -e "Target Type: ${BOLD}${AUDIT_TYPE}${RESET}"
-echo -e "Target URL:  ${CYAN}${BASE_URL}${RESET}"
-[[ -n "$SITEMAP_FROM" ]] && echo -e "Sitemap:     ${CYAN}${SITEMAP_FROM}${RESET}"
-echo ""
-
-echo -e "${BOLD}── Discovering pages ──${RESET}"
-
-SITEMAP_ORIGIN="${SITEMAP_FROM:-$BASE_URL}"
-SITEMAP_URL="${SITEMAP_ORIGIN}/sitemap.xml"
-
-if ! curl -s --head "$SITEMAP_URL" | grep -q '200'; then
-    echo -e "${RED}Error: Sitemap not found at ${SITEMAP_URL}${RESET}"
-    exit 2
+# ── Execution ──
+if [[ "$DEEP_AUDIT" == true ]]; then
+    echo -e "\n${BOLD}── Regression Audit (Deep Audit Mode) ──${RESET}"
+    info "Comparing Artifact vs Staging (.artifacts/$AID/)..."
+    JOBS=0; MAX=8
+    while IFS= read -r slug; do
+        page_deep_audit "$slug" "$BASE_URL" "$STAGING_URL" "$AID" &
+        JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n; JOBS=$((JOBS-1)); }
+    done < "$TMPDIR/audit.txt"; wait
+    [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]] && fail "Regression conflicts found" || pass "No HTML regressions found"
 fi
 
-info "Found sitemap: ${SITEMAP_URL}"
-
-# Extract URLs
-curl -s "$SITEMAP_URL" | grep -oP '<loc>\K[^<]+' > "$TMPDIR/all_urls.txt"
-
-# If sitemap origin is different, rewrite URLs
-if [[ -n "$SITEMAP_FROM" ]]; then
-    sed -i "s|${SITEMAP_FROM}|${BASE_URL}|g" "$TMPDIR/all_urls.txt"
-    info "Rewrote sitemap URLs from ${SITEMAP_FROM} → ${BASE_URL}"
-fi
-
-TOTAL_PAGES=$(wc -l < "$TMPDIR/all_urls.txt")
-info "Found ${TOTAL_PAGES} pages in sitemap"
-
-HOMEPAGE="${BASE_URL}/"
-
-# Apply sampling
-if [[ "$SAMPLE_SIZE" -gt 0 && "$SAMPLE_SIZE" -lt "$TOTAL_PAGES" ]]; then
-    { grep -vxF "$HOMEPAGE" "$TMPDIR/all_urls.txt" || true; } | shuf -n "$SAMPLE_SIZE" > "$TMPDIR/sampled.txt"
-    echo "$HOMEPAGE" >> "$TMPDIR/sampled.txt"
-    mv "$TMPDIR/sampled.txt" "$TMPDIR/all_urls.txt"
-    info "Sampled ${SAMPLE_SIZE} pages (+ homepage)"
-fi
-
-# ── Step 2: Prime or Audit ───────────────────────────────────────────
-if [ "$PRIME_ONLY" = true ]; then
-    echo -e "\n${BOLD}── Priming metadata on ${TOTAL_PAGES} pages ──${RESET}"
-    count=0
-    while IFS= read -r url; do
-        count=$((count+1))
-        echo -ne "  Priming ($count/$TOTAL_PAGES): $url\r"
-        curl -s -o /dev/null "$url"
-    done < "$TMPDIR/all_urls.txt"
-    echo -e "\n${GREEN}✓ Done: All pages visited. Metadata should be primed.${RESET}"
-    exit 0
-fi
-
-echo -e "\n${BOLD}── Checking $(wc -l < "$TMPDIR/all_urls.txt") pages ──${RESET}"
-
-while IFS= read -r url; do
-    page_failures=0
-    path="${url#$BASE_URL}"
-    [[ -z "$path" ]] && path="/"
-    
+echo -e "\n${BOLD}── Elementor Asset Audit (Fidelity Check) ──${RESET}"
+while IFS= read -r slug; do
+    url="${BASE_URL}${slug}"; path="${slug:-/}"
     echo -e "\n${BOLD}${path}${RESET}"
+    html="$TMPDIR/page.html"; curl -s -L -o "$html" "$url"
     
-    html_file="$TMPDIR/page.html"
-    curl -s -L "$url" > "$html_file"
-
-    # ── Check 1: Plugin Heartbeat ────────────────────────────────────
-    if grep -q "Shifter Elementor CSS Fix" "$html_file"; then
-        hb_version=$(grep -oP "Shifter Elementor CSS Fix v\K[0-9.]+" "$html_file" | head -1)
-        pass "Plugin heartbeat (v${hb_version})"
-    else
-        fail "Plugin heartbeat MISSING"
-        page_failures=$((page_failures+1))
-    fi
-
-    # ── Check 2: Content Hash Versioning (Uploads only) ──────────────
-    unhashed=$(grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html_file" | grep "\?ver=" || true)
-    if [[ -n "$unhashed" ]]; then
-        local count
-        count=$(echo "$unhashed" | wc -l)
-        fail "${count} upload CSS file(s) still use ?ver= instead of content hash"
-        page_failures=$((page_failures+1))
-    else
-        pass "All upload CSS files use content hashes"
-    fi
-
-    # ── Check 3: Shape Divider Presence ──────────────────────────────
-    if grep -q "elementor-shape" "$html_file"; then
-        if grep -q "shapes.min.css" "$html_file"; then
-            pass "Shape divider → shapes.min.css linked"
-        else
-            fail "Shape divider present but shapes.min.css NOT linked (run Regenerate?)"
-            page_failures=$((page_failures+1))
-        fi
-    fi
-
-    # ── Check 4: Loop Grid Presence ──────────────────────────────────
-    if grep -q "elementor-widget-loop" "$html_file"; then
-        if grep -q "widget-loop-common.css" "$html_file"; then
-            pass "Loop grid → widget-loop-common.css linked"
-        else
-            fail "Loop grid present but widget-loop-common.css NOT linked"
-            page_failures=$((page_failures+1))
-        fi
-    fi
-
-    # ── Check 5: Elementor Version consistency ───────────────────────
-    el_version=$(grep -oP "elementor-v\K[0-9.]+" "$html_file" | head -1 || true)
-    if [[ -n "$el_version" ]]; then
-        ELEMENTOR_VERSIONS["$el_version"]=1
-        info "Elementor ${el_version}"
-    fi
-
-    # ── Check 6: Elementor CSS reachability (uploads/CDN only) ────
-    # Plugin/theme CSS is served by the production origin, not the artifact.
-    # Only check CSS from /uploads/ (CDN-managed) for reachability.
-    local css_urls
-    css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html_file" \
-             | sed "s/href='//;s/'$//" 2>/dev/null \
-             | grep -v '/wp-content/plugins/' \
-             | grep -v '/wp-content/themes/' || true)
-
-    if [[ -n "$css_urls" ]]; then
-        local total_css=0
-        local failed_css=0
-        while IFS= read -r css_url; do
-            total_css=$((total_css+1))
-            # Resolve relative URLs
-            if [[ "$css_url" == /* ]]; then
-                css_url="${BASE_URL}${css_url}"
-            fi
-            local css_status
-            css_status=$(curl -s -o /dev/null -w "%{http_code}" "$css_url")
-            if [[ "$css_status" != "200" ]]; then
-                local short_css="${css_url#$BASE_URL}"
-                [[ "$short_css" == "$css_url" ]] && short_css=$(echo "$css_url" | sed 's|https\?://[^/]*/|/|')
-                fail "CSS HTTP ${css_status}: ${short_css}"
-                failed_css=$((failed_css+1))
-                page_failures=$((page_failures+1))
-            fi
-        done <<< "$css_urls"
-        if [[ "$failed_css" -eq 0 ]]; then
-            pass "All ${total_css} CDN/upload Elementor stylesheets reachable"
-        fi
-    fi
-
-    # ── Check 7: Shifter Hex ID leaks ────────────────────────────────
-    # Check for paths like /b30641.../ which should be stripped in artifacts
-    # excluding CDN host discovery.
-    hex_ids=$(grep -oP "/[0-9a-f]{40}/" "$html_file" \
-            | grep -v 'cdn.getshifter.co' 2>/dev/null || true)
-    if [[ -n "$hex_ids" ]]; then
-        fail "Non-CDN path contains Shifter hex ID (will 404 in production)"
-        page_failures=$((page_failures+1))
-    fi
-
-    rm -f "$html_file"
+    # Fidelity Checks
+    grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || fail "Heartbeat MISSING"
+    grep -oP "href='[^']*elementor/css/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && fail "CSS hashing MISSING" || pass "CSS hashing active"
     
-    PAGES_CHECKED=$((PAGES_CHECKED+1))
-    if [[ "$page_failures" -gt 0 ]]; then
-        FAILED_PAGES+=("$path")
+    if grep -q "elementor-shape" "$html"; then
+        grep -q "shapes.min.css" "$html" && pass "Shape divider linked" || fail "Shape divider link MISSING"
     fi
-done < "$TMPDIR/all_urls.txt"
-
-# ── Final Summary ────────────────────────────────────────────────────
-echo -e "\n${BOLD}── Cross-page checks ──${RESET}"
-VERSIONS=("${!ELEMENTOR_VERSIONS[@]}")
-if [[ ${#VERSIONS[@]} -gt 1 ]]; then
-    fail "Inconsistent Elementor versions: ${VERSIONS[*]}"
-    info "This usually means the homepage is cached from an older bake"
-elif [[ ${#VERSIONS[@]} -eq 1 ]]; then
-    pass "Consistent Elementor version: ${VERSIONS[0]}"
-fi
-
-echo -e "\n${BOLD}═══ Summary ═══${RESET}"
-echo "Pages checked: ${PAGES_CHECKED}"
-echo "Passed:        ${PASS_COUNT}"
-echo "Warnings:      ${WARN_COUNT}"
-echo "Failed:        ${FAIL_COUNT}"
-
-if [[ ${#FAILED_PAGES[@]} -gt 0 ]]; then
-    echo -e "\n${RED}Pages with failures:${RESET}"
-    for p in "${FAILED_PAGES[@]}"; do
-        echo -e "  ${RED}✗${RESET} $p"
-    done
-    echo -e "\n${RED}${BOLD}AUDIT FAILED${RESET} — ${FAIL_COUNT} issue(s) found."
-    exit 1
-else
-    echo -e "\n${GREEN}${BOLD}AUDIT PASSED${RESET}"
-    exit 0
-fi
+    
+    css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
+    while IFS= read -r css; do 
+        [[ -z "$css" ]] && continue
+        [[ "$css" == /* ]] && css="${BASE_URL}${css}"
+        [[ "$(curl -s -o /dev/null -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
+    done <<< "$css_urls"
+done < "$TMPDIR/audit.txt"

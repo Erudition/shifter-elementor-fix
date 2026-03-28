@@ -45,3 +45,9 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Issue**: Shifter's **Preview** domain (`.preview.getshifter.io`) often returns **403 Forbidden** or **404** when trying to access `.xml` sitemaps directly, even if they are bundled in the artifact.
 *   **The Reason**: This is likely a security/SEO measure to prevent search engines from crawling and indexing unpublished static snapshots.
 *   **The Solution**: When auditing a **Preview Artifact**, use the `--sitemap-from` flag in the `test-artifact.sh` tool to fetch the site structure from the **Live Site** (or **Staging**) and rewrite the URLs to the artifact's domain.
+
+## 11. Provisional Previews & 403 Forbidden
+*   **The Issue**: A Shifter artifact being in the `ready` state does not mean its static preview environment is active. 
+*   **The Symptom**: Attempting to audit or view the `.preview.getshifter.io` URL immediately after a bake often results in a **403 Forbidden** error.
+*   **The Lesson**: The preview environment is created on-demand. To make it accessible to the audit script, it must be "Launch"ed—typically by clicking the 'Preview' button in the Shifter Dashboard.
+*   **The Rule**: If the audit tool reports a 403, verify that the artifact has been provisioned in the dashboard.

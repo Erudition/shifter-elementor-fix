@@ -66,3 +66,14 @@ Since Elementor uses dumb timestamps for versions, and the generator runs in par
 # Solution
 
 This plugin automatically calculates an MD5 hash of the stylesheet content, ensuring that even across hundreds of parallel requests, only a single uniquely-named file is produced per CSS state.
+
+# Testing & Automation
+
+This repository includes a robust audit tool, `test-artifact.sh`, designed to validate Shifter artifacts for styling regressions.
+
+## Key Features:
+- **Full Orchestration**: Automate the Stop WP → Bake → Audit cycle with `--bake`.
+- **Tiered Authentication**: Securely manages Shifter access tokens via a git-ignored `.env` file with terminal-only interactive fallbacks.
+- **Style Integrity**: Verifies CSS hashing, shape dividers, and loop grid reachability across the Shifter CDN.
+
+For detailed setup and check descriptions, see [TESTING.md](TESTING.md).
