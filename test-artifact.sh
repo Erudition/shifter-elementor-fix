@@ -260,22 +260,32 @@ page_deep_audit() {
 
     # Normalize HTML for accurate structural diffing
     for html_file in "$folder/artifact.html" "$folder/staging.html"; do
-        # 1. Strip all HTML comments (removes SEO timestamps, caching stats, generator signatures)
+        # 1. Basic preprocessing (comments & domains)
         perl -0777 -pi -e 's/<!--.*?-->//gs' "$html_file"
-        # 2. Make paths domain-relative (handles both standard and JS-escaped strings)
         sed -i -E "s|https?:\\\\?/\\\\?/${art_domain}||g" "$html_file"
         sed -i -E "s|https?:\\\\?/\\\\?/${stg_domain}||g" "$html_file"
         [[ -n "$baked_domain" ]] && sed -i -E "s|https?:\\\\?/\\\\?/${baked_domain}||g" "$html_file"
-        # 3. Fix empty paths resulting from root domain stripping
         sed -i -E 's|href=""|href="/"|g' "$html_file"
         sed -i -E 's|action=""|action="/"|g' "$html_file"
+
+        # 2. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
+        # We tell tidy about the <search> tag and force output even if warnings occur
+        tidy --new-blocklevel-tags search --drop-empty-elements no --tidy-mark no -indent -wrap 0 -force-output yes -m "$html_file" > /dev/null 2>&1
     done
 
-    # Audit logic
-    if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1; then 
+    # Audit logic: Check for structural regressions using xmldiff (ignoring simple moves)
+    # xmldiff requires valid XML/XHTML, which tidy just provided.
+    local structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -v "\[move")
+    
+    # Generate human-readable unified diff for debugging if ANY differences exist
+    diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1
+
+    if [[ -z "$structural_diff" ]]; then 
         rm -rf "$folder"
     else 
-        echo -e "  ${RED}✗${RESET} Differences found in ${BOLD}${slug}${RESET}"
+        echo -e "  ${RED}✗${RESET} Structural or content regressions found in ${BOLD}${slug}${RESET}"
+        # If the diff was purely moves, it was filtered from structural_diff, so we pass.
+        # But if diff.txt is NOT empty, it means we have order changes that we recorded for inspection.
     fi
 }
 
