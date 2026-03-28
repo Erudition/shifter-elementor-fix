@@ -253,9 +253,27 @@ page_deep_audit() {
     curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}"
     curl -s -L -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}"
     
+    # Extract hostnames for normalization
+    local art_domain=$(echo "$artifact_base" | sed -E 's|^https?://([^/]+).*|\1|')
+    local stg_domain=$(echo "$staging_base" | sed -E 's|^https?://([^/]+).*|\1|')
+    local baked_domain=$(grep -oP '<link rel="canonical" href="https?://\K[^/]+' "$folder/artifact.html" | head -1)
+
+    # Normalize HTML for accurate structural diffing
+    for html_file in "$folder/artifact.html" "$folder/staging.html"; do
+        # 1. Strip all HTML comments (removes SEO timestamps, caching stats, generator signatures)
+        perl -0777 -pi -e 's/<!--.*?-->//gs' "$html_file"
+        # 2. Make paths domain-relative (handles both standard and JS-escaped strings)
+        sed -i -E "s|https?:\\\\?/\\\\?/${art_domain}||g" "$html_file"
+        sed -i -E "s|https?:\\\\?/\\\\?/${stg_domain}||g" "$html_file"
+        [[ -n "$baked_domain" ]] && sed -i -E "s|https?:\\\\?/\\\\?/${baked_domain}||g" "$html_file"
+        # 3. Fix empty paths resulting from root domain stripping
+        sed -i -E 's|href=""|href="/"|g' "$html_file"
+        sed -i -E 's|action=""|action="/"|g' "$html_file"
+    done
+
     # Audit logic
     if diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1; then 
-        rm -rf "$folder"; 
+        rm -rf "$folder"
     else 
         echo -e "  ${RED}✗${RESET} Differences found in ${BOLD}${slug}${RESET}"
     fi
