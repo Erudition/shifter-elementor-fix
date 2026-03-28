@@ -39,6 +39,9 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Evidence**: Deactivating the meta-plugin **instantly** restores these styles site-wide without requiring metadata regeneration or "Priming."
 *   **The Rule**: Keep the Performance Lab meta-plugin DEACTIVATED on Shifter. Its presence is incompatible with how Elementor and Shifter interact.
 
-## 8. Plugin CSS vs. Upload CSS
-*   **The Issue**: Files in `/wp-content/plugins/` are served correctly by the Shifter web server or the production CDN. They are NOT stored in the `/uploads/` bucket and do not experience the same concurrency or duplication bugs.
 *   **The Rule**: The versioning plugin should ONLY touch files in `/wp-content/uploads/elementor/`. Modifying core plugin CSS is unnecessary and risks breaking Elementor's native dependency tree.
+
+## 10. Artifact Sitemap Blocking (Security/SEO)
+*   **The Issue**: Shifter's **Preview** domain (`.preview.getshifter.io`) often returns **403 Forbidden** or **404** when trying to access `.xml` sitemaps directly, even if they are bundled in the artifact.
+*   **The Reason**: This is likely a security/SEO measure to prevent search engines from crawling and indexing unpublished static snapshots.
+*   **The Solution**: When auditing a **Preview Artifact**, use the `--sitemap-from` flag in the `test-artifact.sh` tool to fetch the site structure from the **Live Site** (or **Staging**) and rewrite the URLs to the artifact's domain.
