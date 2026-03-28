@@ -20,9 +20,20 @@ In this mode, the script downloads matching pages from both environments and sto
 
 -   **Parallel Workers**: Uses up to 8 concurrent processes to speed up comparison.
 -   **Structural Normalization**: Uses `tidy-html` to standardize HTML structure and `python-xmldiff` to perform tree-based comparison.
--   **Benign Ignorance**: Automatically masks randomized Elementor Loop item IDs (`e-loop-item-ID-MASKED`) and `post-ID` attributes to ignore content reordering while flagging actual structural regressions.
--   **Automated Cleanup**: If the pages are structurally identical (ignoring "move" operations), the folder is deleted.
+-   **Benign Ignorance**: Automatically masks randomized Elementor Loop item IDs (`e-loop-item-ID-MASKED`), `post-ID` attributes, randomized article content (titles/thumbnails), and dynamic/minified Elementor JS block contents to ignore content reordering/randomization while flagging actual structural regressions.
+-   **Automated Cleanup**: If the pages are structurally identical (ignoring "move" operations and masked content), the folder is deleted.
 -   **Reviewing Issues**: If a folder remains under `artifacts/AID/`, it means a structural discrepancy was found. Check `diff.txt` for the specific tree changes.
+
+### 3. Targeted Subpage Auditing (`--pages`)
+To verify specific pages without running a full site-wide audit (e.g., after fixing a layout issue):
+```bash
+./test-artifact.sh --api --deep-audit --pages "/online-store/,/training/customized/"
+```
+
+## Environmental Caveats
+
+-   **AJAX Fragments**: Post types like `elementskit_content` (used for megamenu fragments) may appear as regressions because the Shifter artifact often contains an empty `<root></root>` for these URLs. This is a crawl/rendering artifact and can be ignored if the actual user-facing pages are clean.
+-   **3rd Party Noise**: The audit automatically neutralizes scripts from common dynamic plugins (e.g., *Optimization Detective*, *Algolia*, *feedback.one*) to prevent false positives from staging-only scripts.
 
 ## Security & Environment Configuration
 
@@ -50,3 +61,9 @@ SHIFTER_ACCESS_TOKEN="eyJraW..."
 *   `tidy-html`: Required for HTML normalization (`tidy`).
 *   `python-xmldiff`: Required for structural tree diffing (`xmldiff`).
 *   `base64`: Required for token validation.
+
+## Guix Environment
+To run the audit tool with all dependencies in a reproducible environment:
+```bash
+guix shell tidy-html python-xmldiff jq curl coreutils perl -- ./test-artifact.sh --api --site-id [SITE_ID] --deep-audit
+```

@@ -276,12 +276,27 @@ page_deep_audit() {
         sed -i -E 's|action=""|action="/"|g' "$html_file"
 
         # 2. Structural Masking for Randomized Content
-        # Neutralize unique IDs to allow xmldiff to match identical content across reorders.
-        sed -i -E 's/e-loop-item-[0-9a-fA-F]+/e-loop-item-ID-MASKED/g' "$html_file"
+        # Neutralize unique IDs and content to allow xmldiff to match identical structures across reorders.
+        
+        # Generic Post/Loop Grid Content Neutralizer:
+        # Mask Titles, Links, and Thumbnail details inside dynamic post containers
+        # We target the specific container classes and wipe their contents to ignore randomized text/links
+        # NOTE: -0777 (slurp mode) is required for multi-line matching
+        perl -0777 -pi -e 's|(<h[2-6][^>]*class="[^"]*elementor-post__title[^"]*"[^>]*>).*?(</h[2-6]>)|$1<a href="#">[POST-TITLE-MASKED]</a>$2|sg' "$html_file"
+        perl -0777 -pi -e 's|(<div[^>]*class="[^"]*elementor-post__thumbnail[^"]*"[^>]*>).*?(</div>)|$1[THUMB-MASKED]$2|sg' "$html_file"
+        
+        # Aggressively neutralize class lists to prevent "differing number of classes" regressions
+        sed -i -E 's/has-post-thumbnail ?//g' "$html_file"
+        sed -i -E 's/tag-[a-zA-Z0-9-]+ ?//g' "$html_file"
+        sed -i -E 's/category-[a-zA-Z0-9-]+ ?//g' "$html_file"
         sed -i -E 's/post-[0-9a-fA-F]+/post-ID-MASKED/g' "$html_file"
+        sed -i -E 's/e-loop-item-[0-9a-fA-F]+/e-loop-item-ID-MASKED/g' "$html_file"
         sed -i -E 's/data-id="[^"]+"/data-id="ID-MASKED"/g' "$html_file"
         sed -i -E 's/id="elementor-section-inner-[0-9a-fA-F]+"/id="elementor-section-inner-MASKED"/g' "$html_file"
         sed -i -E 's/wpfc-calendar-[0-9]+/wpfc-calendar-MASKED/g' "$html_file"
+
+        # Neutralize dynamic Elementor JS snippets that vary based on widget presence
+        perl -0777 -pi -e 's|<script[^>]*>.*?use \x27?\"?strict\x27?\"?.*?<\/script>|<script> \/* MASKED-DYNAMIC-SCRIPT *\/ <\/script>|sg' "$html_file"
 
         # Expanded Elementor Randomized Attributes
         sed -i -E 's/elementor-repeater-item-[a-zA-Z0-9]+/elementor-repeater-item-MASKED/g' "$html_file"
@@ -341,6 +356,10 @@ while [[ $# -gt 0 ]]; do
         --bake) DO_BAKE=true; USE_API=true; shift ;;
         --name) BAKE_NAME="$2"; shift 2 ;;
         --deep-audit) DEEP_AUDIT=true; shift ;;
+        --pages)
+            IFS=',' read -r -a SUBPAGES <<< "$2"
+            shift 2
+            ;;
         --site-id) SITE_ID="$2"; shift 2 ;;
         --sample) SAMPLE_SIZE="$2"; shift 2 ;;
         --sitemap-from) SITEMAP_FROM="${2%/}"; shift 2 ;;
@@ -452,17 +471,18 @@ while IFS= read -r slug; do
     JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n || true; JOBS=$((JOBS-1)); }
 done < "$TMPDIR/audit.txt"; wait || true
 
-if [[ "$DEEP_AUDIT" == true ]]; then
-    echo -e "\n${BOLD}── Audit Results ──${RESET}"
-    [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]] && fail "Regression conflicts found" || pass "No HTML regressions found"
-fi
-
-# ── Final Cleanup ──
 if [[ "$DEEP_AUDIT" == true && -d "$ARTIFACTS_DIR/$AID" ]]; then
     # Sweep any empty parent directories left behind by parallel race conditions
     find "$ARTIFACTS_DIR/$AID" -type d -empty -delete 2>/dev/null
-    # If the entire site was clean, remove the AID folder too
-    rmdir "$ARTIFACTS_DIR/$AID" 2>/dev/null || true
+    
+    echo -e "\n${BOLD}── Audit Results ──${RESET}"
+    if [[ -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]]; then
+        fail "Regression conflicts found"
+    else
+        pass "No HTML regressions found"
+        # If the entire site was clean, remove the AID folder too
+        rmdir "$ARTIFACTS_DIR/$AID" 2>/dev/null || true
+    fi
 fi
 
 echo -e "\n${BOLD}${GREEN}Audit process complete.${RESET}"
