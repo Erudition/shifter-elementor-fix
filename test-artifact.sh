@@ -196,17 +196,21 @@ shifter_wait_for_bake() {
     local site_id="$1"
     local aid="$2"
     local start_t=$(date +%s)
-    local percent=0
-    while [[ "$percent" -lt 100 ]]; do
+    local status="increation"
+    while [[ "$status" == "increation" ]]; do
         local progress=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/check_generator_process" -H "Authorization: ${ACCESS_TOKEN}")
-        percent=$(echo "$progress" | jq -r '.percent // 0')
+        local percent=$(echo "$progress" | jq -r '.percent // 0')
         local current=$(echo "$progress" | jq -r '.created_url // 0')
         local total=$(echo "$progress" | jq -r '.sum_url // 0')
         local step=$(echo "$progress" | jq -r '.step // "Starting"')
         echo -ne "  ${YELLOW}⌛ Bake Progress: ${percent}% (${current}/${total} pages) - ${step}...\r${RESET}" >&2
+        
+        # Poll artifact status directly
         local artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$aid\")")
-        [[ "$(echo "$artifact_data" | jq -r '.status')" == "error" ]] && { echo -e "\n${RED}Error: Bake failed.${RESET}" >&2; exit 1; }
-        [[ "$percent" -lt 100 ]] && sleep 10
+        status=$(echo "$artifact_data" | jq -r '.status')
+        [[ "$status" == "error" ]] && { echo -e "\n${RED}Error: Bake failed.${RESET}" >&2; exit 1; }
+        [[ "$status" == "ready" || "$status" == "published-shifter" ]] && break
+        sleep 10
     done
     local end_t=$(date +%s); local dur=$((end_t - start_t))
     echo -e "\n  ${GREEN}✓${RESET} Bake completed in ${BOLD}$((dur/60))m $((dur%60))s${RESET}" >&2
