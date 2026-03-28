@@ -269,8 +269,8 @@ page_deep_audit() {
         sed -i -E 's|action=""|action="/"|g' "$html_file"
 
         # 2. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
-        # We tell tidy about the <search> tag and force output even if warnings occur
-        tidy --new-blocklevel-tags search --drop-empty-elements no --tidy-mark no -indent -wrap 0 -force-output yes -m "$html_file" > /dev/null 2>&1
+        # Uses tidy.config for support of newer tags like <search> and structural standardization
+        tidy -config tidy.config -m "$html_file" > /dev/null 2>&1
     done
 
     # Audit logic: Check for structural regressions using xmldiff (ignoring simple moves)
