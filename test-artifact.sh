@@ -278,6 +278,11 @@ page_deep_audit() {
         # 2. Structural Masking for Randomized Content
         # Neutralize unique IDs and content to allow xmldiff to match identical structures across reorders.
         
+        # Head Neutralizers: Mask dynamic noise in the <head>
+        perl -0777 -pi -e 's|<script type=\"speculationrules\"[^>]*>.*?</script>|[MASKED-SPECULATION-RULES]|sg' "$html_file"
+        perl -0777 -pi -e 's|<link rel=\"alternate\"[^>]*>|[MASKED-ALT-LINK]|g' "$html_file"
+        perl -0777 -pi -e 's|<meta name=\"generator\"[^>]*>|[MASKED-GENERATOR]|g' "$html_file"
+        
         # Generic Post/Loop Grid Content Neutralizer:
         # Mask Titles, Links, and Thumbnail details inside dynamic post containers
         # We target the specific container classes and wipe their contents to ignore randomized text/links
@@ -313,11 +318,9 @@ page_deep_audit() {
         sed -i -E 's/"_id":"[a-zA-Z0-9]+"/"_id":"ID-MASKED"/g' "$html_file"
 
         # 3. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
-        # We use --show-body-only to avoid DOCTYPE parsing issues in xmldiff
+        # We no longer use --show-body-only to ensure <head> metadata is audited
         local tmp=$(mktemp)
-        echo "<root>" > "$tmp"
-        tidy -config tidy.config --show-body-only yes "$html_file" >> "$tmp" 2>/dev/null || true
-        echo "</root>" >> "$tmp"
+        tidy -config tidy.config "$html_file" > "$tmp" 2>/dev/null || true
         mv "$tmp" "$html_file"
     done
 
