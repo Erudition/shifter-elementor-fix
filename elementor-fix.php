@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Shifter Elementor CSS Fix
  * Description: Robust CSS versioning for Elementor on Shifter. Replaces query-string versioning with content-hash-based filenames to bypass CDN caching and resolve build race conditions.
- * Version: 3.1
+ * Version: 3.2
  * Author: Antigravity AI
  */
 
@@ -12,7 +12,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
  * Add a debug signature to the HTML to verify the plugin is active in bakes.
  */
 add_action( 'wp_head', function() {
-    echo "\n<!-- Shifter Elementor CSS Fix v3.1 ACTIVE -->\n";
+    echo "\n<!-- Shifter Elementor CSS Fix v3.2 ACTIVE -->\n";
 }, 1 );
 
 /**
@@ -76,6 +76,48 @@ function shifter_css_filename_versioning($src, $handle) {
 
     if (!file_exists($local_path)) {
         return $src;
+    }
+
+    /**
+     * STABLE READ GUARANTEE: Ensure Elementor has finished writing the file.
+     * We wait until the file size is non-zero and has stopped changing.
+     * This prevents capturing partial CSS files during parallel bakes.
+     */
+    static $stable_files = [];
+    if (!isset($stable_files[$local_path])) {
+        $max_retries = 15;
+        $last_size = -1;
+        for ($i = 0; $i < $max_retries; $i++) {
+            clearstatcache(true, $local_path);
+            if (!file_exists($local_path)) {
+                usleep(100000);
+                continue;
+            }
+            $current_size = filesize($local_path);
+            
+            // Check for size stability and non-zero content
+            if ($current_size > 0 && $current_size === $last_size) {
+                // Final Integrity Check: Does it end with a closing brace or comment?
+                $fp = @fopen($local_path, 'rb');
+                if ($fp) {
+                    fseek($fp, -32, SEEK_END);
+                    $tail = fread($fp, 32);
+                    fclose($fp);
+                    if (strpos($tail, '}') !== false || strpos($tail, '*/') !== false) {
+                        $stable_files[$local_path] = true;
+                        break;
+                    }
+                }
+            }
+            
+            $last_size = $current_size;
+            usleep(100000); // 100ms wait
+        }
+        
+        // If we still didn't reach stability, something is wrong with the disk write
+        if (!isset($stable_files[$local_path])) {
+            return $src; // Fallback to original URL
+        }
     }
 
     /**
