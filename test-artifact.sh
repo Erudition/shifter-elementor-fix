@@ -296,7 +296,6 @@ page_deep_audit() {
         sed -i -E 's/has-post-thumbnail ?//g' "$html_file"
         sed -i -E 's/tag-[a-zA-Z0-9-]+ ?//g' "$html_file"
         sed -i -E 's/category-[a-zA-Z0-9-]+ ?//g' "$html_file"
-        sed -i -E 's/post-[0-9a-fA-F]+/post-ID-MASKED/g' "$html_file"
         sed -i -E 's/e-loop-item-[0-9a-fA-F]+/e-loop-item-ID-MASKED/g' "$html_file"
         sed -i -E 's/data-id="[^"]+"/data-id="ID-MASKED"/g' "$html_file"
         sed -i -E 's/id="elementor-section-inner-[0-9a-fA-F]+"/id="elementor-section-inner-MASKED"/g' "$html_file"
@@ -388,7 +387,7 @@ if [[ "$USE_API" == true ]]; then
             info "Latching onto existing bake: ${CYAN}${AID}${RESET}..." >&2
         else
             shifter_stop_wordpress "$SITE_ID"
-            AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
+            AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME") || exit 1
         fi
         shifter_wait_for_bake "$SITE_ID" "$AID"
         shifter_launch_preview "$SITE_ID" "$AID"
