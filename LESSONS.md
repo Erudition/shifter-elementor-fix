@@ -69,3 +69,15 @@ This document records the architectural pitfalls and solutions discovered while 
     2.  **Structural Masking (`sed`)**: Replace randomized numeric IDs with a generic `ID-MASKED` token before the comparison phase.
     3.  **Hhigh-Fidelity Diff (`xmldiff`)**: Perform a tree-based comparison that ignores "move" operations (reordering of identical nodes) while flagging actual node name, attribute, or text content changes.
 *   **The Result**: The engine now correctly prunes identical pages even if IDs have shifted, providing high-confidence regression signatures.
+
+## 15. PHP Worker Exhaustion & Thread Latency
+*   **The Issue**: Adding manual `usleep()` delays or mandatory filesystem wait loops inside frequently fired filters (like `style_loader_src`) artificially inflates the lifecycle of the PHP request.
+*   **The Pitfall**: Because Shifter generates sites massively in parallel (the crawler hits 10-20 pages at once), those minor 100ms artificial delays stack exponentially and immediately exhaust the small PHP-FPM child pool inside the container.
+*   **The Result**: Bizarre, non-deterministic HTTP rendering behavior where elements of the HTML `<head>` (like essential Elementor `<link>` tags) are arbitrarily dropped due to underlying request timeouts or process thread shedding before the function concludes. 
+*   **The Rule**: Custom build-step interceptors must execute as close to 0ms as possible. If file verification loops are strictly necessary, test preconditions (like file-end integrity) *before* invoking `sleep()`.
+
+## 16. Elementor Meta-Cache Race Conditions (Redis Cache Poisoning)
+*   **The Issue**: Elementor maps which dynamic stylesheets are required for a template (like Single Post or single course logic) into the `_elementor_page_assets` meta key. On Shifter, this database query is aggressively cached by the system Redis drop-in.
+*   **The Architecture Pitfall**: If a PHP Worker Exhaustion event or a race condition occurs exactly while Elementor is rendering the page for the first time in a new bake, Elementor's CSS pipeline can abort mid-stream.
+*   **The Consequence**: Elementor saves the *corrupted, incomplete* array (missing specific CSS links) into Redis as the "truth". Even if you fix the root cause (e.g., removing the FPM loop latency), Elementor will forever blindly load the poisoned map from Redis on every subsequent bake, making the regression appear non-deterministic.
+*   **The Solution**: If `<link>` tags arbitrarily vanish from the HTML artifact, **purge the Object Cache (Redis)** to force Elementor to rebuild the true `_elementor_page_assets` payload mapping natively.
