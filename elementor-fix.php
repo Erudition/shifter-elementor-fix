@@ -11,31 +11,7 @@ if ( ! defined( 'ABSPATH' ) ) exit;
 /**
  * Add a debug signature to the HTML to verify the plugin is active in bakes.
  */
-add_action( 'wp_head', function() {
-    echo "\n<!-- Shifter Elementor CSS Fix v3.2 ACTIVE -->\n";
-}, 1 );
 
-/**
- * Concurrency lock to prevent file corruption during parallel requests during the Shifter bake process.
- */
-function shifter_concurrency_lock($local_path) {
-    if (!is_string($local_path)) {
-        return;
-    }
-    
-    static $locked = [];
-    if (isset($locked[$local_path])) {
-        return;
-    }
-    
-    // Create a sidecar lock file
-    $lock_handle = @fopen($local_path . '.copy.lock', 'w+');
-    if ($lock_handle && @flock($lock_handle, LOCK_EX)) {
-        $locked[$local_path] = $lock_handle;
-    } elseif ($lock_handle) {
-        @fclose($lock_handle);
-    }
-}
 
 /**
  * Filter: style_loader_src
@@ -89,14 +65,7 @@ function shifter_css_filename_versioning($src, $handle) {
         $last_size = -1;
         for ($i = 0; $i < $max_retries; $i++) {
             clearstatcache(true, $local_path);
-            if (!file_exists($local_path)) {
-                usleep(100000);
-                continue;
-            }
-            $current_size = filesize($local_path);
-            
-            // Check for size stability and non-zero content
-            if ($current_size > 0 && $current_size === $last_size) {
+            if (file_exists($local_path) && filesize($local_path) > 0) {
                 // Final Integrity Check: Does it end with a closing brace or comment?
                 $fp = @fopen($local_path, 'rb');
                 if ($fp) {
@@ -110,7 +79,6 @@ function shifter_css_filename_versioning($src, $handle) {
                 }
             }
             
-            $last_size = $current_size;
             usleep(100000); // 100ms wait
         }
         
@@ -142,10 +110,23 @@ function shifter_css_filename_versioning($src, $handle) {
      * Atomic Copy with Lock
      */
     if (!file_exists($new_local_path)) {
-        shifter_concurrency_lock($local_path); // Ensure file is stable before copy
-        
-        if (!@copy($local_path, $new_local_path)) {
-            return $src; // Fallback to original on failure
+        $lock_file = $local_path . '.copy.lock';
+        $lock_handle = @fopen($lock_file, 'w+');
+        if ($lock_handle && @flock($lock_handle, LOCK_EX)) {
+            $copy_success = true;
+            // Check again inside lock to prevent race condition
+            if (!file_exists($new_local_path)) {
+                $copy_success = @copy($local_path, $new_local_path);
+            }
+            
+            @flock($lock_handle, LOCK_UN);
+            @fclose($lock_handle);
+            
+            if (!$copy_success) {
+                return $src; // Fallback to original on failure
+            }
+        } elseif ($lock_handle) {
+            @fclose($lock_handle);
         }
     }
 

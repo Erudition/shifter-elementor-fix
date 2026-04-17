@@ -279,9 +279,11 @@ page_deep_audit() {
         # Neutralize unique IDs and content to allow xmldiff to match identical structures across reorders.
         
         # Head Neutralizers: Mask dynamic noise in the <head>
-        perl -0777 -pi -e 's|<script type=\"speculationrules\"[^>]*>.*?</script>|[MASKED-SPECULATION-RULES]|sg' "$html_file"
         perl -0777 -pi -e 's|<link rel=\"alternate\"[^>]*>|[MASKED-ALT-LINK]|g' "$html_file"
         perl -0777 -pi -e 's|<meta name=\"generator\"[^>]*>|[MASKED-GENERATOR]|g' "$html_file"
+        
+        # URL Normalization: Convert escaped slashes (common in JSON/scripts) to allow consistent diffing
+        sed -i 's|\\/|/|g' "$html_file"
         
         # Generic Post/Loop Grid Content Neutralizer:
         # Mask Titles, Links, and Thumbnail details inside dynamic post containers
