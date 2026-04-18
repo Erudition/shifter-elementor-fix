@@ -13,3 +13,4 @@
 
 - **File Locking**: Use `flock` to prevent race conditions during parallel CSS generation in the Shifter build process.
 - **Content-Based Hashing**: Use MD5 content hashes for stylesheet versioning to ensure cache-friendly, unique filenames across builds.
+- **Shifter Media CDN Role**: The CDN (`cdn.getshifter.co`) is an immutable, write-only S3 symlink. It is used intentionally to prevent static artifact bloat. Because CSS files are uniquely hashed, Elementor updates do not overwrite older artifact versions, making them safe for CDN offloading. The bake intentionally skips CSS compilation into the zip.
