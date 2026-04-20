@@ -248,10 +248,10 @@ page_deep_audit() {
     [[ "$slug" != */ ]] && slug="${slug}/"
     local safe_s="${slug%/}"; safe_s="${safe_s#/}"
     [[ -z "$safe_s" ]] && safe_s="homepage"
-    local folder="$ARTIFACTS_DIR/$aid/$safe_s"; mkdir -p "$folder"
-    # Fetch with Referer header to bypass CloudFront hotlink protection
-    curl -s -L -f -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download artifact for $slug"; return; }
-    curl -s -L -f -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download staging for $slug"; return; }
+    local user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    # Fetch with Referer and Browser UA. Do NOT use Shifter Auth for Public/CDN checks.
+    curl -s -L -f -H "User-Agent: $user_agent" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download artifact for $slug"; return; }
+    curl -s -L -f -H "User-Agent: $user_agent" -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download staging for $slug"; return; }
     
     # Extract hostnames for normalization
     local art_domain=$(echo "$artifact_base" | sed -E 's|^https?://([^/]+).*|\1|')
@@ -458,17 +458,33 @@ while IFS= read -r slug; do
 
         # Fidelity Checks (Fetch once and audit)
         html=$(mktemp)
-        curl -s -L -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
+        # Use Standard Browser User-Agent and Referer. Do NOT use Shifter Auth for Public/CDN checks.
+        local user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
         
         echo -e "\n${BOLD}${path}${RESET}"
         grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || warn "Heartbeat missing (This is normal if page is non-Elementor)"
-        grep -oP "href='[^']*elementor\/css\/post-[^']*\'" "$html" | grep -v "\.[a-f0-9]\{10\}\.css" | grep -q "?ver=" && warn "CSS hashing missing (This is normal for some page types)" || pass "CSS hashing active"
+        
+        # Hash Enforcement: Fail if any Elementor post CSS link is missing the 10-char content hash
+        while IFS= read -r link; do
+            [[ -z "$link" ]] && continue
+            if ! echo "$link" | grep -qP "\.[a-f0-9]{10}\.css"; then
+                fail "Unversioned Elementor CSS (Potential Stale Content): $link"
+            else
+                pass "CSS Hash detected: $(echo "$link" | grep -oP '[a-f0-9]{10}\.css')"
+            fi
+        done <<< "$(grep -oP "href='[^']*elementor/css/post-[^']*'" "$html" | sed "s/href='//;s/'$//" || true)"
         
         css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
         while IFS= read -r css; do 
             [[ -z "$css" ]] && continue
             [[ "$css" == /* ]] && css="${BASE_URL}${css}"
-            [[ "$(curl -s -o /dev/null -H "Authorization: ${ACCESS_TOKEN}" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]] || fail "CSS 404: $css"
+            # Check asset integrity without Authorization header to test real-world CDN availability
+            if [[ "$(curl -s -o /dev/null -L -H "User-Agent: $user_agent" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]]; then
+                pass "Asset reachable: $(basename "$css")"
+            else
+                fail "Asset Missing/Blocked: $css"
+            fi
         done <<< "$css_urls"
         rm -f "$html"
     ) &

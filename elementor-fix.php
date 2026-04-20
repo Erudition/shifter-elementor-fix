@@ -50,6 +50,8 @@ function shifter_css_filename_versioning($src, $handle) {
     }
 
     $rel_path = substr($path, $pos + strlen($upload_token));
+    // Strip query strings and fragments from the physical path
+    $rel_path = preg_replace('/(\?|#).*$/', '', $rel_path);
     $local_path = $upload_base_path . '/' . ltrim($rel_path, '/');
 
     if (!file_exists($local_path)) {
@@ -58,86 +60,96 @@ function shifter_css_filename_versioning($src, $handle) {
 
     /**
      * STABLE READ GUARANTEE: Ensure Elementor has finished writing the file.
-     * We wait until the file size is non-zero and has stopped changing.
-     * This prevents capturing partial CSS files during parallel bakes.
+     * We wait until the file is structurally complete and contains no placeholders.
      */
     static $stable_files = [];
     if (!isset($stable_files[$local_path])) {
         $max_retries = 15;
-        $last_size = -1;
         for ($i = 0; $i < $max_retries; $i++) {
             clearstatcache(true, $local_path);
             if (file_exists($local_path) && filesize($local_path) > 0) {
-                // Final Integrity Check: Does it end with a closing brace or comment?
-                $fp = @fopen($local_path, 'rb');
-                if ($fp) {
-                    fseek($fp, -32, SEEK_END);
-                    $tail = fread($fp, 32);
-                    fclose($fp);
-                    if (strpos($tail, '}') !== false || strpos($tail, '*/') !== false) {
+                $content = @file_get_contents($local_path);
+                if ($content) {
+                    // Integrity Check: Balanced Braces + No Placeholders
+                    $braces_open = substr_count($content, '{');
+                    $braces_close = substr_count($content, '}');
+                    
+                    if ($braces_open > 0 && $braces_open === $braces_close && strpos($content, '{{WRAPPER}}') === false) {
                         $stable_files[$local_path] = true;
                         break;
                     }
                 }
             }
-            
             usleep(100000); // 100ms wait
         }
         
-        // If we still didn't reach stability, something is wrong with the disk write
+        // If still unstable, return a URL that the audit tool will flag as a failure.
         if (!isset($stable_files[$local_path])) {
-            return $src; // Fallback to original URL
+            return preg_replace('/\.css(\?.*)?$/', '.unstable-content.css', $src);
         }
     }
 
     /**
      * Generate Content-Based Hash
-     * Use a static cache to avoid redundant MD5 calls in a single request.
      */
     static $hash_cache = [];
     if (!isset($hash_cache[$local_path])) {
-        // Grab first 10 chars of MD5 for a clean, stable version string
         $hash_cache[$local_path] = substr(md5_file($local_path), 0, 10);
     }
     $hash = $hash_cache[$local_path];
 
     /**
-     * Rename the file to include the hash.
-     * We calculate the new local path for the filesystem copy.
+     * Version Migration: Extract existing ?ver= and inject into filename.
      */
-    $new_path_fragment = preg_replace('/\.css$/', '.' . $hash . '.css', $path);
-    $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path_fragment, $pos + strlen($upload_token)), '/');
-
-    /**
-     * Atomic Copy with Lock
-     */
-    if (!file_exists($new_local_path)) {
-        $lock_file = $local_path . '.copy.lock';
-        $lock_handle = @fopen($lock_file, 'w+');
-        if ($lock_handle && @flock($lock_handle, LOCK_EX)) {
-            $copy_success = true;
-            // Check again inside lock to prevent race condition
-            if (!file_exists($new_local_path)) {
-                $copy_success = @copy($local_path, $new_local_path);
-            }
-            
-            @flock($lock_handle, LOCK_UN);
-            @fclose($lock_handle);
-            
-            if (!$copy_success) {
-                return $src; // Fallback to original on failure
-            }
-        } elseif ($lock_handle) {
-            @fclose($lock_handle);
+    $ver = '';
+    if (isset($url['query'])) {
+        parse_str($url['query'], $query_params);
+        if (isset($query_params['ver'])) {
+            $ver = '.v' . preg_replace('/[^a-zA-Z0-9_\.-]/', '', (string)$query_params['ver']);
         }
     }
 
     /**
-     * Final URL construction:
-     * Surgically replace the filename and STRIP optional query strings.
-     * Regex ensures we catch .css regardless of following ?ver= strings.
+     * Determine New Path
      */
-    return preg_replace('/\.css(\?.*)?$/', '.' . $hash . '.css', $src);
+    $new_path_fragment = preg_replace('/\.css$/', $ver . '.' . $hash . '.css', $path);
+    $new_local_path = $upload_base_path . '/' . ltrim(substr($new_path_fragment, $pos + strlen($upload_token)), '/');
+    $new_local_path = preg_replace('/(\?|#).*$/', '', $new_local_path);
+
+    /**
+     * S3-Native Atomic Creation
+     * Use 'x' mode to ensure only one worker performs the copy.
+     */
+    if (!file_exists($new_local_path)) {
+        // Attempt to create the file exclusively
+        $handle = @fopen($new_local_path, 'x');
+        if ($handle) {
+            // We are the winner! Perform the copy.
+            if (@copy($local_path, $new_local_path)) {
+                @fclose($handle);
+            } else {
+                @fclose($handle);
+                @unlink($new_local_path); // Cleanup on failure
+                return preg_replace('/\.css(\?.*)?$/', '.copy-failed.css', $src);
+            }
+        } else {
+            // If fopen failed, another worker is already handling it or it already exists.
+            // We MUST wait for it to be physically available on S3 before returning the URL.
+            $wait_retries = 10;
+            for ($j = 0; $j < $wait_retries; $j++) {
+                clearstatcache(true, $new_local_path);
+                if (file_exists($new_local_path)) {
+                    break;
+                }
+                usleep(200000); // 200ms wait
+            }
+        }
+    }
+
+    /**
+     * Return the versioned URL. No fallback allowed.
+     */
+    return preg_replace('/\.css(\?.*)?$/', $ver . '.' . $hash . '.css', $src);
 }
 
 
