@@ -76,8 +76,32 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Result**: Bizarre, non-deterministic HTTP rendering behavior where elements of the HTML `<head>` (like essential Elementor `<link>` tags) are arbitrarily dropped due to underlying request timeouts or process thread shedding before the function concludes. 
 *   **The Rule**: Custom build-step interceptors must execute as close to 0ms as possible. If file verification loops are strictly necessary, test preconditions (like file-end integrity) *before* invoking `sleep()`.
 
-## 16. Elementor Meta-Cache Race Conditions (Redis Cache Poisoning)
-*   **The Issue**: Elementor maps which dynamic stylesheets are required for a template (like Single Post or single course logic) into the `_elementor_page_assets` meta key. On Shifter, this database query is aggressively cached by the system Redis drop-in.
-*   **The Architecture Pitfall**: If a PHP Worker Exhaustion event or a race condition occurs exactly while Elementor is rendering the page for the first time in a new bake, Elementor's CSS pipeline can abort mid-stream.
-*   **The Consequence**: Elementor saves the *corrupted, incomplete* array (missing specific CSS links) into Redis as the "truth". Even if you fix the root cause (e.g., removing the FPM loop latency), Elementor will forever blindly load the poisoned map from Redis on every subsequent bake, making the regression appear non-deterministic.
-*   **The Solution**: If `<link>` tags arbitrarily vanish from the HTML artifact, **purge the Object Cache (Redis)** to force Elementor to rebuild the true `_elementor_page_assets` payload mapping natively.
+## 17. S3-Native Atomicity vs. `flock()`
+*   **The Issue**: Traditional PHP `flock()` relies on the underlying filesystem supporting advisory locks.
+*   **The Pitfall**: Shifter's S3 stream wrapper (s3-uploads) **silently ignores** `flock()`, returning `true` without actually locking the file. This leads to hidden race conditions during parallel bakes.
+*   **The Solution**: Use **`fopen(..., 'x')`** (Exclusive Create). On S3, this utilizes the "Put if not exists" protocol. Only the first worker to initiate the write will succeed; all others will fail immediately.
+*   **The Rule**: Never use `flock()` on S3. Use atomic creation modes (`x`) to manage distributed concurrency.
+
+## 18. Database-Backed Hash Registry
+*   **The Issue**: In a parallel bake, hundreds of workers may hit pages sharing the same CSS file (e.g., `global.css`). 
+*   **The Pitfall**: If every worker performs its own `md5_file()` and `copy()` operation, the redundant S3 traffic and CPU load can crash the bake or trigger CloudFront rate limits.
+*   **The Solution**: Use the WordPress database (the `shifter_css_hashes` option) as a central registry.
+*   **The Logic**: The first worker to version a file saves the mapping to the database. All subsequent workers perform a lightweight `get_option()` check and return the hashed URL instantly without ever touching the S3 filesystem.
+
+## 19. The "Fallback" Masking Trap
+*   **The Issue**: If a plugin fails to version a file (e.g., due to a timeout) and "falls back" to the original unversioned URL, the page may appear to load correctly.
+*   **The Pitfall**: Because the unversioned file still exists on S3, the audit tool sees a **200 OK** and passes the page. However, that file might be **stale content** from months ago, cached for a year by CloudFront.
+*   **The Solution**: **Strict Audit Enforcement**. The audit tool now uses regex to ensure EVERY Elementor CSS link contains a signature 10-char hash. Any URL without a hash is treated as a critical failure, even if it returns 200.
+*   **The Rule**: Fallbacks are bugs. If you can't version it, fail the audit so it can be fixed.
+
+## 20. The "Source of Truth" Persistence
+*   **The Issue**: It is tempting to `rename()` (move) the unversioned file to the hashed name to save S3 space.
+*   **The Failure**: If Worker A renames `post-1510.css` to `post-1510.HASH.css`, Worker B (hitting a secondary page at the same millisecond) will find the source file **missing** and fail its own hashing process.
+*   **The Rule**: The unversioned file must remain as a **read-only template** for all parallel workers until the bake is finalized. Hashed files are immutable and must not be deleted, preserving compatibility with older artifacts.
+
+## 21. Native Elementor CSS Architecture (Investigation)
+*   **The Issue**: Theoretical uncertainty about "multi-phase" writing where placeholders might be written to disk.
+*   **The Research**: A review of `Elementor\Core\Files\CSS\Base` and `Post` classes (v3.25.0) confirms that Elementor generates CSS strings in-memory and writes them using a single `file_put_contents` call.
+*   **The Lesson**: There is no native "template phase" on disk. If `{{WRAPPER}}` appears in an artifact, it is a sign of a failed memory-replacement loop or a process abortion.
+*   **The "Done" Metric**: The `Elementor\Stylesheet` rendering engine is deterministic; every selector block is wrapped in braces. Therefore, `count('{') === count('}')` is a high-fidelity test for a complete file, far superior to file size or age.
+*   **Query String Myths**: Elementor's native `?ver=` is tied to the file's modification timestamp, not the plugin code version. Our MD5 content-hashing is the most stable approach for CDN consistency.
