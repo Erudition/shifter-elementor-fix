@@ -248,6 +248,7 @@ page_deep_audit() {
     [[ "$slug" != */ ]] && slug="${slug}/"
     local safe_s="${slug%/}"; safe_s="${safe_s#/}"
     [[ -z "$safe_s" ]] && safe_s="homepage"
+    local folder=$(mktemp -d)
     local user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     # Fetch with Referer and Browser UA. Do NOT use Shifter Auth for Public/CDN checks.
     curl -s -L -f -H "User-Agent: $user_agent" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download artifact for $slug"; return; }
@@ -459,44 +460,162 @@ while IFS= read -r slug; do
         # Fidelity Checks (Fetch once and audit)
         html=$(mktemp)
         # Use Standard Browser User-Agent and Referer. Do NOT use Shifter Auth for Public/CDN checks.
-        local user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
         
         echo -e "\n${BOLD}${path}${RESET}"
         grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || warn "Heartbeat missing (This is normal if page is non-Elementor)"
         
-        # Hash Enforcement: Fail if any Elementor post CSS link is missing the 10-char content hash
+        # Hash Enforcement: Fail if ANY Elementor stylesheet in /uploads/ is missing the 10-char content hash
+        # Standard stylesheets in /plugins/ are exempt.
         while IFS= read -r link; do
             [[ -z "$link" ]] && continue
-            if ! echo "$link" | grep -qP "\.[a-f0-9]{10}\.css"; then
-                fail "Unversioned Elementor CSS (Potential Stale Content): $link"
-            else
-                pass "CSS Hash detected: $(echo "$link" | grep -oP '[a-f0-9]{10}\.css')"
+            
+            # Identify if it's a "User Stylesheet" (generated in uploads)
+            if echo "$link" | grep -q "/uploads/elementor/"; then
+                # FAIL if it contains a query parameter (indicates stale Shifter fallback)
+                if echo "$link" | grep -q "[?&]ver="; then
+                    fail "Fallback Detected (Query Param in Uploads): $link"
+                # FAIL if it doesn't match our specific vVERSION.HASH.css format
+                elif ! echo "$link" | grep -qP "\.v[0-9.]+\.[a-f0-9]{10}\.css"; then
+                    fail "Unversioned User Stylesheet (Timestamp Detected): $link"
+                else
+                    pass "Hashed User Stylesheet detected: $(basename "$link")"
+                fi
             fi
-        done <<< "$(grep -oP "href='[^']*elementor/css/post-[^']*'" "$html" | sed "s/href='//;s/'$//" || true)"
+
+check_asset_integrity() {
+    local link="$1"; local user_agent="$2"; local base_url="$3"; local staging_url="${4:-}"
+    local asset_tmp=$(mktemp)
+    local http_code=$(curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${base_url}/" -o "$asset_tmp" -w "%{http_code}" "$link")
+    
+    if [[ "$http_code" == "200" ]]; then
+        local size=$(stat -c%s "$asset_tmp")
+        if [[ "$size" -eq 0 ]]; then
+            fail "Integrity Failure (Empty File): $link"
+        elif grep -q "{{WRAPPER}}" "$asset_tmp"; then
+            fail "Canary Detected (Unreplaced Placeholders): $link"
+        else
+            # 1. Brace check: Elementor CSS must be balanced
+            local open_braces=$(grep -o "{" "$asset_tmp" | wc -l)
+            local close_braces=$(grep -o "}" "$asset_tmp" | wc -l)
+            if [[ "$open_braces" -ne "$close_braces" ]]; then
+                fail "Integrity Failure (Brace Mismatch $open_braces vs $close_braces): $link"
+            # 2. Staging Parity check: Identify silent truncations
+            elif [[ -n "$staging_url" && "$link" == *"/uploads/elementor/"* ]]; then
+                # Extract the base filename (e.g., post-311.css) to find it on Staging
+                local base_file=$(echo "$link" | grep -oP "post-\d+\.css|custom-[^.]+\.css" | head -1)
+                if [[ -n "$base_file" ]]; then
+                    local stg_link="${staging_url}/wp-content/uploads/elementor/css/${base_file}"
+                    local stg_size=$(curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${staging_url}/" -o /dev/null -w "%{size_download}" "$stg_link")
+                    if [[ "$stg_size" -gt 0 ]]; then
+                        # Fail if artifact is significantly smaller than staging (e.g. < 80% of size)
+                        # We use bc for float math or simple integer bash math
+                        local min_expected=$(( stg_size * 80 / 100 ))
+                        if [[ "$size" -lt "$min_expected" ]]; then
+                            fail "Staging Parity Failure (Staging: ${stg_size} bytes, Artifact: ${size} bytes): $link"
+                        else
+                            pass "Asset verified: $(basename "$link") (${size} bytes)"
+                        fi
+                    else
+                        pass "Asset verified: $(basename "$link") (${size} bytes) - Staging source not found for parity"
+                    fi
+                else
+                     pass "Asset verified: $(basename "$link") (${size} bytes)"
+                fi
+            else
+                pass "Asset verified: $(basename "$link") (${size} bytes)"
+            fi
+        fi
+    else
+        fail "Asset Missing/Blocked ($http_code): $link"
+    fi
+    rm -f "$asset_tmp"
+}
+
+# ── Arguments & Orchestration ─────────────────────────────────────────
+            # Always check reachability and integrity regardless of origin
+            [[ "$link" == /* ]] && link="${BASE_URL}${link}"
+            check_asset_integrity "$link" "$user_agent" "$BASE_URL" "${STAGING_URL:-}"
+        done <<< "$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" || true)"
+        # 3. Breadcrumb & Inline CSS Extraction
+        local summary_log="$TMPDIR/summaries.log"
+        local css_size_log="$TMPDIR/css_sizes.log"
         
-        css_urls=$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" | grep -v '/wp-content/plugins/' || true)
-        while IFS= read -r css; do 
-            [[ -z "$css" ]] && continue
-            [[ "$css" == /* ]] && css="${BASE_URL}${css}"
-            # Check asset integrity without Authorization header to test real-world CDN availability
-            if [[ "$(curl -s -o /dev/null -L -H "User-Agent: $user_agent" -H "Referer: ${BASE_URL}/" -w "%{http_code}" "$css")" == "200" ]]; then
-                pass "Asset reachable: $(basename "$css")"
-            else
-                fail "Asset Missing/Blocked: $css"
-            fi
-        done <<< "$css_urls"
+        # Extract Summary Breadcrumb (capture everything through end-of-comment)
+        local summary
+        summary=$(grep -oP '<!-- shifter-css-fix-summary: \K[^-]+(?=\s*-->)' "$html" | tr -d '\n' || echo "none")
+        if [[ "$summary" != "none" && -n "$summary" ]]; then
+            echo "$path $summary" >> "$summary_log"
+            pass "Breadcrumb detected"
+        else
+            warn "Breadcrumb summary missing"
+        fi
+
+        # Extract Inline CSS Block and measure its size
+        # We target the 'elementor-frontend-inline-css' style block
+        local inline_css=$(perl -0777 -ne 'print $1 if /<style id="elementor-frontend-inline-css">(.+?)<\/style>/s' "$html" | tr -d '[:space:]' || true)
+        local inline_size=${#inline_css}
+        if [[ $inline_size -gt 0 ]]; then
+            echo "$path $inline_size" >> "$css_size_log"
+            # We don't report success here, we aggregate at the end
+        fi
+
         rm -f "$html"
     ) &
     JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n || true; JOBS=$((JOBS-1)); }
 done < "$TMPDIR/audit.txt"; wait || true
 
+# ── Final Aggregation & Consistency Checks ───────────────────────────
+
+echo -e "\n${BOLD}── Post-Audit Consistency Analysis ──${RESET}"
+
+# 1. Inline CSS Consistency
+if [[ -f "$TMPDIR/css_sizes.log" ]]; then
+    info "Analyzing Inline CSS consistency across $(wc -l < "$TMPDIR/css_sizes.log") pages..."
+    # Find the most common size (the mode)
+    MODE_SIZE=$(awk '{print $2}' "$TMPDIR/css_sizes.log" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
+    TOTAL_PAGES=$(wc -l < "$TMPDIR/css_sizes.log")
+    ANOMALIES=$(awk -v mode="$MODE_SIZE" '$2 != mode {print $1 " (" $2 " bytes)"}' "$TMPDIR/css_sizes.log")
+    
+    if [[ -z "$ANOMALIES" ]]; then
+        pass "CSS Consistency: All pages have identical inline CSS blocks ($MODE_SIZE bytes)"
+    else
+        fail "CSS Inconsistency Detected! Majority size is $MODE_SIZE, but these pages differ:"
+        echo "$ANOMALIES" | sed 's/^/    - /'
+        # Note: fail() already incremented FAIL_COUNT
+    fi
+fi
+
+# 2. Breadcrumb Statistics
+if [[ -f "$TMPDIR/summaries.log" ]]; then
+    info "Breadcrumb statistics:"
+    # Count occurrences of pre-warmed vs cache-hit
+    PW_COUNT=$(grep -o "pre-warmed=[^ ]*" "$TMPDIR/summaries.log" | grep -v "pre-warmed=0" | wc -l || echo 0)
+    CH_COUNT=$(grep -o "cache-hit=[^ ]*" "$TMPDIR/summaries.log" | grep -v "cache-hit=0" | wc -l || echo 0)
+    LOCK_WRITES=$(grep -o "lock-wrote=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-wrote=0" | wc -l || echo 0)
+    LOCK_SKIPS=$(grep -o "lock-skipped=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-skipped=0" | wc -l || echo 0)
+    TIMEOUTS=$(grep -o "lock-timeout=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-timeout=0" | wc -l || echo 0)
+    
+    echo -e "    - Pre-warmed events:  $PW_COUNT"
+    echo -e "    - Cache hit events:   $CH_COUNT"
+    echo -e "    - Lock write events:  $LOCK_WRITES"
+    echo -e "    - Lock skip events:   $LOCK_SKIPS"
+    
+    if [[ "$TIMEOUTS" -gt 0 ]]; then
+        fail "Advisory Lock Timeouts: $TIMEOUTS"
+    else
+        pass "No advisory lock timeouts detected"
+    fi
+fi
+
 if [[ "$DEEP_AUDIT" == true && -d "$ARTIFACTS_DIR/$AID" ]]; then
     # Sweep any empty parent directories left behind by parallel race conditions
     find "$ARTIFACTS_DIR/$AID" -type d -empty -delete 2>/dev/null
     
+    # Audit Results summary doesn't need to reference the loop variable
     echo -e "\n${BOLD}── Audit Results ──${RESET}"
-    if [[ -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]]; then
+    if [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]]; then
         fail "Regression conflicts found"
     else
         pass "No HTML regressions found"
