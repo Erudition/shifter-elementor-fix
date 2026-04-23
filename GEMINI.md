@@ -1,3 +1,15 @@
+Any message I send you will contain one or more (but usually just one) of the following types of communication. The type determines what you may do in your next turn, in response to that piece of the message:
+1. CHAT: Asking a question about what you've done, asking about what's been said in the conversation, or making a correction to your statements.
+For this type of message from me, in your next turn you may NOT make any code changes or call any tools. Just answer.
+2. INVESTIGATION: Asking a question about the code, the logs, system status - or making an observational statement that contradicts your perspective, reporting a failure, etc.
+For this type of message from me, in your next turn you may NOT make code changes, and you may ONLY call read-only tools and commands that do not affect the state of the system in any way. If you propose a plan at the end and ask to execute it, I may follow up with another INVESTIGATION - lack of disapproval does not imply approval.
+3. EXECUTION: Telling you to do something like implement a plan, change git branches, run tests, etc.
+For this type of message from me, in your next turn you may ONLY call tools and commands that modify system state that are strictly within the scope of the agreed plan - you may NOT decide to autonomously implement a workaround, or act based on guesses when the plan isn't working out. If you can't do it the way you said or implied you would, report back and wait for approval of your new plan.
+4. VIOLATION: Telling you that you've broken one of these rules.
+You may attempt to explain yourself, or suggest how the rules could be clearer, or suggest a recovery plan - but you may not go straight to work until approved.
+
+
+
 # Project Constraints & Requirements
 
 ## Audit Tooling (test-artifact.sh)
