@@ -81,20 +81,27 @@ add_action('elementor/init', function() {
 }, 100);
 
 /**
- * SECTION 3: BREADCRUMB OUTPUT
+ * SECTION 3: BREADCRUMB OUTPUT (DIAGNOSTIC)
+ * We output this in wp_head to ensure visibility before any stripping or truncation.
  */
-add_action('wp_footer', function() {
+add_action('init', function() { shifter_css_breadcrumb('init', 1); });
+
+add_action('wp_head', function() {
     global $shifter_css_breadcrumbs;
     if (empty($shifter_css_breadcrumbs)) return;
 
     $summary = [];
     foreach ($shifter_css_breadcrumbs as $key => $ids) {
         $unique_ids = array_unique($ids);
+        if ($key === 'init') {
+             $summary[] = "init=" . count($ids);
+             continue;
+        }
         $summary[] = $key . '=' . (empty($unique_ids) ? '0' : implode(',', $unique_ids));
     }
 
     echo "\n<!-- shifter-css-fix-summary: " . esc_html(implode(' ', $summary)) . " -->\n";
-}, 999);
+}, 5);
 
 /**
  * SECTION 2: ADVISORY LOCKING

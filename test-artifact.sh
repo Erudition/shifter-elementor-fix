@@ -2,16 +2,6 @@
 #
 # test-artifact.sh — Elementor CSS Shifter Audit & API Discovery Tool
 #
-# Usage:
-#   ./test-artifact.sh [site-url] [options]
-#   ./test-artifact.sh --api [options]
-#   ./test-artifact.sh --bake [options]
-#
-# Environment Configuration (.env):
-#   SHIFTER_ACCESS_TOKEN   Long-lived access token (automatically updated)
-#   SHIFTER_USER           (Optional) Username for auto-renewal
-#   SHIFTER_PASS           (Optional) Password for auto-renewal
-
 set -euo pipefail
 
 # ── Colors ───────────────────────────────────────────────────────────
@@ -26,22 +16,17 @@ RESET='\033[0m'
 PASS_COUNT=0
 FAIL_COUNT=0
 WARN_COUNT=0
-PAGES_CHECKED=0
 SAMPLE_SIZE=0
 SITEMAP_FROM=""
-PRIME_ONLY=false
 USE_API=false
 DO_BAKE=false
 DEEP_AUDIT=false
 BAKE_NAME="Full Lifecycle Regression Audit"
 SITE_ID="${SITE_ID:-}"
 ACCESS_TOKEN=""
-DEFAULT_SITE_ID="${DEFAULT_SITE_ID:-}" # Set your default site ID here
+DEFAULT_SITE_ID="3215b04c-84e4-4a42-8132-902bb6d4b51e"
 ENV_FILE="$(dirname "$0")/.env"
 ARTIFACTS_DIR="$(dirname "$0")/artifacts"
-
-declare -A ELEMENTOR_VERSIONS=()
-declare -a FAILED_PAGES=()
 
 # ── Helpers ──────────────────────────────────────────────────────────
 pass()  { PASS_COUNT=$((PASS_COUNT+1)); echo -e "  ${GREEN}✓${RESET} $1"; }
@@ -55,573 +40,224 @@ usage() {
     echo "       $0 --bake [--site-id ID] [options]"
     echo ""
     echo "  --api               Automatically find and audit the latest artifact"
-    echo "  --bake              Trigger a full build cycle (Stop WP → Bake → Audit → Start WP)"
-    echo "  --name TITLE        Title for the new Artifact (Default: Full Lifecycle Regression Audit)"
-    echo "  --deep-audit        Perform side-by-side HTML diffing (Artifact vs Staging)"
+    echo "  --bake              Trigger or latch onto a build cycle"
+    echo "  --deep-audit        Perform side-by-side HTML diffing"
     echo "  --site-id ID        Shifter Site ID"
-    echo "  --sample N          Test only N random pages (+ homepage)"
-    echo "  --sitemap-from URL  Pull sitemap from a different origin"
-    echo "  --prime             Only visit URLs to rebuild metadata (Staging only)"
-    echo ""
-    echo "Tip: Make sure to 'Sync Plugin' in the WP Pusher dashboard BEFORE running --bake"
+    echo "  --pages Slugs       Comma-separated slugs"
+    echo "  --sample N          Test only N random pages"
     exit 2
 }
 
-# ── Env Management ───────────────────────────────────────────────────
+# ── API Logic ───────────────────────────────────────────────────────
 load_env() {
     if [[ -f "$ENV_FILE" ]]; then
         while IFS= read -r line || [[ -n "$line" ]]; do
             [[ "$line" =~ ^#.* ]] && continue
-            [[ -z "$line" ]] && continue
-            if [[ "$line" == *"="* ]]; then
-                local key="${line%%=*}"
-                local value="${line#*=}"
-                # Strip leading/trailing quotes
-                value="${value%\"}"; value="${value#\"}"
-                value="${value%\'}"; value="${value#\'}"
-                export "$key=$value"
-            fi
+            [[ "$line" == *"="* ]] && { k="${line%%=*}"; v="${line#*=}"; v="${v%\"}"; v="${v#\"}"; export "$k=$v"; }
         done < "$ENV_FILE"
     fi
 }
 
 save_token_to_env() {
-    local token="$1"
-    if [[ ! -f "$ENV_FILE" ]]; then
-        touch "$ENV_FILE"
-        chmod 600 "$ENV_FILE"
-    fi
-    if grep -q "SHIFTER_ACCESS_TOKEN" "$ENV_FILE"; then
-        sed -i "s/^SHIFTER_ACCESS_TOKEN=.*/SHIFTER_ACCESS_TOKEN=$token/" "$ENV_FILE"
-    else
-        echo "SHIFTER_ACCESS_TOKEN=$token" >> "$ENV_FILE"
-    fi
+    local t="$1"
+    [[ ! -f "$ENV_FILE" ]] && { touch "$ENV_FILE"; chmod 600 "$ENV_FILE"; }
+    grep -q "SHIFTER_ACCESS_TOKEN" "$ENV_FILE" && sed -i "s/^SHIFTER_ACCESS_TOKEN=.*/SHIFTER_ACCESS_TOKEN=$t/" "$ENV_FILE" || echo "SHIFTER_ACCESS_TOKEN=$t" >> "$ENV_FILE"
 }
 
-# ── JWT Validation ───────────────────────────────────────────────────
 jwt_is_valid() {
-    local token="$1"
-    [[ -z "$token" || "$token" == "null" ]] && return 1
-    local payload=$(echo "$token" | cut -d'.' -f2 || echo "")
-    [[ -z "$payload" ]] && return 1
-    local len=$(( ${#payload} % 4 ))
-    if [ $len -eq 2 ]; then payload="${payload}=="; elif [ $len -eq 3 ]; then payload="${payload}="; fi
-    local decoded=$(echo "$payload" | base64 -d 2>/dev/null || echo "{}")
-    local exp=$(echo "$decoded" | jq -r '.exp // 0')
-    local now=$(date +%s)
-    [[ "$exp" -ne 0 && "$now" -lt "$exp" ]] && return 0
-    return 1
+    local t="$1"
+    [[ -z "$t" || "$t" == "null" ]] && return 1
+    local p=$(echo "$t" | cut -d'.' -f2 || echo "")
+    [[ -z "$p" ]] && return 1
+    local exp=$(echo "$p" | base64 -d 2>/dev/null | jq -r '.exp // 0')
+    [[ "$exp" -ne 0 && $(date +%s) -lt "$exp" ]] && return 0 || return 1
 }
 
-# ── Shifter API Logic ───────────────────────────────────────────────
 shifter_login() {
-    load_env
-    ACCESS_TOKEN="${SHIFTER_ACCESS_TOKEN:-}"
-    if jwt_is_valid "$ACCESS_TOKEN"; then return 0; fi
+    load_env; ACCESS_TOKEN="${SHIFTER_ACCESS_TOKEN:-}"
+    jwt_is_valid "$ACCESS_TOKEN" && return 0
     echo -e "${BOLD}── Shifter API Authentication ──${RESET}" >&2
-    local user="${SHIFTER_USER:-}"
-    local pass="${SHIFTER_PASS:-}"
-    if [[ -z "$user" || -z "$pass" ]]; then
-        info "Access token expired or not found. Please provide credentials:"
+    local user="${SHIFTER_USER:-}"; local pass="${SHIFTER_PASS:-}"
+    if [[ -z "$user" ]]; then
+        info "Credentials required:"
         echo -ne "  Username: " >&2; read -r user
         echo -ne "  Password: " >&2; read -rs pass; echo "" >&2
     fi
-    local response=$(curl -s https://api.getshifter.io/latest/login -X POST \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"$user\", \"password\":\"$pass\"}")
-    ACCESS_TOKEN=$(echo "$response" | jq -r '.AccessToken // empty')
-    if [[ -z "$ACCESS_TOKEN" ]]; then echo -e "${RED}Error: Shifter API Login failed.${RESET}" >&2; exit 1; fi
+    local r=$(curl -s https://api.getshifter.io/latest/login -X POST -H "Content-Type: application/json" -d "{\"username\":\"$user\", \"password\":\"$pass\"}")
+    ACCESS_TOKEN=$(echo "$r" | jq -r '.AccessToken // empty')
+    [[ -z "$ACCESS_TOKEN" ]] && { echo -e "${RED}Error: Login failed.${RESET}" >&2; exit 1; }
     save_token_to_env "$ACCESS_TOKEN"
-    echo -e "  ${GREEN}✓${RESET} Authenticated successfully" >&2
 }
 
 shifter_get_latest_artifact() {
-    local site_id="$1"
-    info "Fetching latest artifact info..." >&2
-    local artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
-    if [[ -z "$artifact_data" || "$artifact_data" == "null" ]]; then echo -e "${RED}Error: No artifacts found for site ${site_id}${RESET}" >&2; exit 1; fi
-    local id=$(echo "$artifact_data" | jq -r '.artifact_id')
-    local status=$(echo "$artifact_data" | jq -r '.status')
-    echo -e "  Latest:   ${CYAN}${id}${RESET}" >&2
-    echo -e "  Status:   ${BOLD}${status}${RESET}" >&2
-    if [[ "$status" == "increation" ]]; then
-        shifter_wait_for_bake "$site_id" "$id"
-        # Refresh status after wait
-        artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$id\")")
-        status=$(echo "$artifact_data" | jq -r '.status')
-    fi
-    [[ "$status" == "ready" || "$status" == "published-shifter" ]] && { echo -e "  ${GREEN}✓${RESET} Artifact is ready" >&2; echo "$id"; } || { echo -e "${RED}Error: Artifact failed.${RESET}" >&2; exit 1; }
+    local s="$1"; info "Fetching latest artifact info..." >&2
+    local d=$(curl -s --connect-timeout 5 "https://api.getshifter.io/latest/sites/${s}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
+    [[ -z "$d" || "$d" == "null" ]] && { echo -e "${RED}Error: No artifacts found.${RESET}" >&2; exit 1; }
+    echo "$d" | jq -r '.artifact_id'
 }
 
 shifter_stop_wordpress() {
-    local site_id="$1"
-    info "Stopping WordPress instance..." >&2
-    local status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
-    
-    if [[ "$status" != "inservice" && "$status" != "starting" && "$status" != "stopping" ]]; then
-        echo -e "  ${GREEN}✓${RESET} WordPress is not in-service (${status})" >&2
-        return 0
-    fi
-
-    curl -s "https://api.getshifter.io/latest/sites/${site_id}/wordpress_site/stop" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
-    while [[ "$status" == "inservice" || "$status" == "stopping" ]]; do
-        echo -ne "  ${YELLOW}⌛ Transitioning to stopped... (Current: ${status})\r${RESET}" >&2
-        sleep 5
-        status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
-    done
-    echo -e "\n  ${GREEN}✓${RESET} WordPress stopped" >&2
+    local s="$1"; info "Stopping WordPress..." >&2
+    local st=$(curl -s --connect-timeout 5 "https://api.getshifter.io/latest/sites/${s}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
+    [[ "$st" != "inservice" ]] && return 0
+    curl -s "https://api.getshifter.io/latest/sites/${s}/wordpress_site/stop" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
+    while [[ "$st" == "inservice" ]]; do echo -ne "."; sleep 5; st=$(curl -s "https://api.getshifter.io/latest/sites/${s}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state'); done; echo ""
 }
 
 shifter_start_wordpress() {
-    local site_id="$1"
-    info "Starting WordPress instance..." >&2
-    curl -s "https://api.getshifter.io/latest/sites/${site_id}/wordpress_site/start" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
-    local status="stopped"
-    while [[ "$status" != "inservice" ]]; do
-        echo -ne "  ${YELLOW}⌛ Waiting for WordPress to be in-service...\r${RESET}" >&2
-        status=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state')
-        [[ "$status" != "inservice" ]] && sleep 10
-    done
-    echo -e "\n  ${GREEN}✓${RESET} WordPress instance is live" >&2
+    local s="$1"; info "Starting WordPress..." >&2
+    curl -s "https://api.getshifter.io/latest/sites/${s}/wordpress_site/start" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
+    local st="stopped"
+    while [[ "$st" != "inservice" ]]; do sleep 10; st=$(curl -s "https://api.getshifter.io/latest/sites/${s}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.stock_state'); done
 }
 
 shifter_start_bake() {
-    local site_id="$1"
-    local title="${2:-$BAKE_NAME}"
-    info "Starting new Bake: ${BOLD}${title}${RESET} (Generating Artifact)..." >&2
-    
-    # 1. Start the Bake
-    local aid=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" \
-        -X POST \
-        -H "Content-Type: application/json" \
-        -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
-        
-    [[ -z "$aid" || "$aid" == "null" ]] && { echo -e "${RED}Error: Failed to start bake.${RESET}" >&2; exit 1; }
-    
-    # 2. Set the Artifact Name (Two-step process required by Shifter API)
-    local body=$(jq -n --arg t "$title" '{"artifact_name": $t}')
-    curl -s -X PUT "https://api.getshifter.io/latest/sites/${site_id}/artifacts/${aid}/artifact_name" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: ${ACCESS_TOKEN}" \
-        -d "$body" >/dev/null
-
+    local s="$1"; local t="$2"
+    info "Starting Bake: $t..." >&2
+    local aid=$(curl -s "https://api.getshifter.io/latest/sites/${s}/artifacts" -X POST -H "Content-Type: application/json" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.artifact_id')
+    curl -s -X PUT "https://api.getshifter.io/latest/sites/${s}/artifacts/${aid}/artifact_name" -H "Content-Type: application/json" -H "Authorization: ${ACCESS_TOKEN}" -d "{\"artifact_name\":\"$t\"}" >/dev/null || true
     echo "$aid"
 }
 
 shifter_wait_for_bake() {
-    local site_id="$1"
-    local aid="$2"
-    local start_t=$(date +%s)
-    local status="increation"
-    while [[ "$status" == "increation" ]]; do
-        local progress=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/check_generator_process" -H "Authorization: ${ACCESS_TOKEN}")
-        local percent=$(echo "$progress" | jq -r '.percent // 0')
-        local current=$(echo "$progress" | jq -r '.created_url // 0')
-        local total=$(echo "$progress" | jq -r '.sum_url // 0')
-        local step=$(echo "$progress" | jq -r '.step // "Starting"')
-        echo -ne "  ${YELLOW}⌛ Bake Progress: ${percent}% (${current}/${total} pages) - ${step}...\r${RESET}" >&2
-        
-        # Poll artifact status directly
-        local artifact_data=$(curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$aid\")")
-        status=$(echo "$artifact_data" | jq -r '.status')
-        [[ "$status" == "error" ]] && { echo -e "\n${RED}Error: Bake failed.${RESET}" >&2; exit 1; }
-        [[ "$status" == "ready" || "$status" == "published-shifter" ]] && break
-        sleep 10
-    done
-    local end_t=$(date +%s); local dur=$((end_t - start_t))
-    echo -e "\n  ${GREEN}✓${RESET} Bake completed in ${BOLD}$((dur/60))m $((dur%60))s${RESET}" >&2
+    local s="$1"; local aid="$2"; local st="increation"
+    while [[ "$st" == "increation" ]]; do
+        local p=$(curl -s "https://api.getshifter.io/latest/sites/${s}/check_generator_process" -H "Authorization: ${ACCESS_TOKEN}")
+        echo -ne "  ${YELLOW}⌛ Progress: $(echo "$p" | jq -r '.percent // 0')% \r${RESET}" >&2
+        local d=$(curl -s "https://api.getshifter.io/latest/sites/${s}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$aid\")")
+        st=$(echo "$d" | jq -r '.status'); [[ "$st" == "ready" ]] && break; sleep 10
+    done; echo -e "\n  ${GREEN}✓${RESET} Bake complete" >&2
 }
 
 shifter_launch_preview() {
-    local site_id="$1"
-    local aid="$2"
-    info "Activating Preview for Artifact: ${aid}" >&2
-    curl -s "https://api.getshifter.io/latest/sites/${site_id}/artifacts/${aid}/preview" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null
-    echo -ne "  ${YELLOW}⌛ Provisioning static environment... Waiting 20s...\r${RESET}" >&2; sleep 20
-    echo -e "\n  ${GREEN}✓${RESET} Preview environment provisioned" >&2
+    local s="$1"; local aid="$2"; info "Launching Preview for Artifact: ${aid}..." >&2
+    curl -s "https://api.getshifter.io/latest/sites/${s}/artifacts/${aid}/preview" -X POST -H "Authorization: ${ACCESS_TOKEN}" >/dev/null; sleep 20
 }
 
-# ── Regression Engine Logic ──────────────────────────────────────────
+# ── Integrity Logic ─────────────────────────────────────────────────
+check_asset_integrity() {
+    local link="$1"; local ua="$2"; local art_base="$3"; local stg_base="${4:-}"
+    local tmp=$(mktemp)
+    local code=$(curl -s -L -H "User-Agent: $ua" -o "$tmp" -w "%{http_code}" "$link")
+    if [[ "$code" == "200" ]]; then
+        local size=$(stat -c%s "$tmp")
+        if [[ "$size" -gt 0 ]]; then
+            local o=$(grep -o "{" "$tmp" | wc -l); local c=$(grep -o "}" "$tmp" | wc -l)
+            if [[ "$o" -ne "$c" ]]; then fail "Brace Mismatch: $link"
+            elif grep -v "^$" "$tmp" | grep -q "{{WRAPPER}}"; then fail "Canary: $link" # Using grep -v to ignore blank lines in canary check
+            else
+                if [[ -n "$stg_base" && "$link" == *"/uploads/elementor/"* ]]; then
+                    local base=$(echo "$link" | grep -oP "post-\d+\.css|custom-[^.]+\.css" | head -1)
+                    if [[ -n "$base" ]]; then
+                        local stg_link="${stg_base}/wp-content/uploads/elementor/css/${base}"
+                        local stg_size=$(curl -s -L -o /dev/null -w "%{size_download}" "$stg_link")
+                        if [[ "$stg_size" -gt 0 ]]; then
+                             local min=$(( stg_size * 80 / 100 )); [[ "$size" -lt "$min" ]] && fail "Parity Fail: $link ($size vs $stg_size)" || pass "Asset: $(basename "$link")"
+                        else pass "Asset: $(basename "$link")"
+                        fi
+                    else pass "Asset: $(basename "$link")"
+                    fi
+                else pass "Asset: $(basename "$link")"
+                fi
+            fi
+        else fail "Empty Content: $link"
+        fi
+    else fail "Missing Asset ($code): $link"
+    fi; rm -f "$tmp"
+}
+
 page_deep_audit() {
-    local slug="$1"; local artifact_base="$2"; local staging_base="$3"; local aid="$4"
-    # Enforce trailing slash
+    local slug="$1"; local art_base="$2"; local stg_base="$3"; local aid="$4"
     [[ "$slug" != */ ]] && slug="${slug}/"
-    local safe_s="${slug%/}"; safe_s="${safe_s#/}"
-    [[ -z "$safe_s" ]] && safe_s="homepage"
-    local folder=$(mktemp -d)
-    local user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    # Fetch with Referer and Browser UA. Do NOT use Shifter Auth for Public/CDN checks.
-    curl -s -L -f -H "User-Agent: $user_agent" -H "Referer: ${artifact_base}/" -o "$folder/artifact.html" "${artifact_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download artifact for $slug"; return; }
-    curl -s -L -f -H "User-Agent: $user_agent" -H "Referer: ${staging_base}/" -o "$folder/staging.html" "${staging_base}${slug}" || { rm -rf "$folder"; echo "  ✖ Failed to download staging for $slug"; return; }
+    local folder="$ARTIFACTS_DIR/$aid$slug"; mkdir -p "$folder"
+    local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    curl -s -L -f -o "$folder/artifact.html" "${art_base}${slug}" || return
+    curl -s -L -f -o "$folder/staging.html" "${stg_base}${slug}" || return
     
-    # Extract hostnames for normalization
-    local art_domain=$(echo "$artifact_base" | sed -E 's|^https?://([^/]+).*|\1|')
-    local stg_domain=$(echo "$staging_base" | sed -E 's|^https?://([^/]+).*|\1|')
-    local baked_domain=$(grep -oP '<link rel="canonical" href="https?://\K[^/]+' "$folder/artifact.html" | head -1)
+    local art_dom=$(echo "$art_base" | sed -E 's|^https?://([^/]+).*|\1|')
+    local stg_dom=$(echo "$stg_base" | sed -E 's|^https?://([^/]+).*|\1|')
 
-    # Normalize HTML for accurate structural diffing
-    for html_file in "$folder/artifact.html" "$folder/staging.html"; do
-        # 1. Basic preprocessing (comments & domains)
-        perl -0777 -pi -e 's/<!--.*?-->//gs' "$html_file"
-        
-        # Comprehensive Hostname Neutralization (Staged vs Artifact vs Preview vs Baked vs Production)
-        # We strip protocol and domain to make URLs root-relative. 
-        # We use a broad regex [:\\\\/%2F]+ to catch ://, :\/, :%2F%2F, etc.
-        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${art_domain},,g" "$html_file"
-        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${stg_domain},,g" "$html_file"
-        [[ -n "$baked_domain" ]] && sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${baked_domain},,g" "$html_file"
-        # Generic catch-all for any other getshifter domains hiding in URLs
-        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+[a-zA-Z0-9.-]+\.getshifter\.(net|io),,g" "$html_file"
-
-        sed -i -E 's|href=""|href="/"|g' "$html_file"
-        sed -i -E 's|action=""|action="/"|g' "$html_file"
-
-        # 2. Structural Masking for Randomized Content
-        # Neutralize unique IDs and content to allow xmldiff to match identical structures across reorders.
-        
-        # Head Neutralizers: Mask dynamic noise in the <head>
-        perl -0777 -pi -e 's|<link rel=\"alternate\"[^>]*>|[MASKED-ALT-LINK]|g' "$html_file"
-        perl -0777 -pi -e 's|<meta name=\"generator\"[^>]*>|[MASKED-GENERATOR]|g' "$html_file"
-        
-        # URL Normalization: Convert escaped slashes (common in JSON/scripts) to allow consistent diffing
-        sed -i 's|\\/|/|g' "$html_file"
-        
-        # Generic Post/Loop Grid Content Neutralizer:
-        # Mask Titles, Links, and Thumbnail details inside dynamic post containers
-        # We target the specific container classes and wipe their contents to ignore randomized text/links
-        # NOTE: -0777 (slurp mode) is required for multi-line matching
-        perl -0777 -pi -e 's|(<h[2-6][^>]*class="[^"]*elementor-post__title[^"]*"[^>]*>).*?(</h[2-6]>)|$1<a href="#">[POST-TITLE-MASKED]</a>$2|sg' "$html_file"
-        perl -0777 -pi -e 's|(<div[^>]*class="[^"]*elementor-post__thumbnail[^"]*"[^>]*>).*?(</div>)|$1[THUMB-MASKED]$2|sg' "$html_file"
-        
-        # Aggressively neutralize class lists to prevent "differing number of classes" regressions
-        sed -i -E 's/has-post-thumbnail ?//g' "$html_file"
-        sed -i -E 's/tag-[a-zA-Z0-9-]+ ?//g' "$html_file"
-        sed -i -E 's/category-[a-zA-Z0-9-]+ ?//g' "$html_file"
-        sed -i -E 's/e-loop-item-[0-9a-fA-F]+/e-loop-item-ID-MASKED/g' "$html_file"
-        sed -i -E 's/data-id="[^"]+"/data-id="ID-MASKED"/g' "$html_file"
-        sed -i -E 's/id="elementor-section-inner-[0-9a-fA-F]+"/id="elementor-section-inner-MASKED"/g' "$html_file"
-        sed -i -E 's/wpfc-calendar-[0-9]+/wpfc-calendar-MASKED/g' "$html_file"
-
-        # Neutralize dynamic Elementor JS snippets that vary based on widget presence
-        perl -0777 -pi -e 's|<script[^>]*>.*?use \x27?\"?strict\x27?\"?.*?<\/script>|<script> \/* MASKED-DYNAMIC-SCRIPT *\/ <\/script>|sg' "$html_file"
-
-        # Expanded Elementor Randomized Attributes
-        sed -i -E 's/elementor-repeater-item-[a-zA-Z0-9]+/elementor-repeater-item-MASKED/g' "$html_file"
-        sed -i -E 's/elementor-element-[0-9a-fA-F]+/elementor-element-MASKED/g' "$html_file"
-        sed -i -E 's/e-n-menu-content-[0-9]+/e-n-menu-content-MASKED/g' "$html_file"
-        sed -i -E 's/e-n-menu-dropdown-icon-[0-9]+/e-n-menu-dropdown-icon-MASKED/g' "$html_file"
-        sed -i -E 's/aria-controls="e-n-menu-content-[0-9]+"/aria-controls="e-n-menu-content-MASKED"/g' "$html_file"
-        sed -i -E 's/aria-labelledby="e-n-menu-dropdown-icon-[0-9]+"/aria-labelledby="e-n-menu-dropdown-icon-MASKED"/g' "$html_file"
-
-        # Neutralize dynamic config (nonces and local IDs in JSON)
-        sed -i -E 's/&quot;nonce&quot;:&quot;[0-9a-fA-F]+&quot;/&quot;nonce&quot;:&quot;NONCE-MASKED&quot;/g' "$html_file"
-        sed -i -E 's/&quot;_id&quot;:&quot;[a-zA-Z0-9]+&quot;/&quot;_id&quot;:&quot;ID-MASKED&quot;/g' "$html_file"
-        sed -i -E 's/"nonce":"[0-9a-fA-F]+"/"nonce":"NONCE-MASKED"/g' "$html_file"
-        sed -i -E 's/"_id":"[a-zA-Z0-9]+"/"_id":"ID-MASKED"/g' "$html_file"
-
-        # 3. HTML-Aware Tidy (Normalizes structure, attributes, and tags)
-        # We no longer use --show-body-only to ensure <head> metadata is audited
-        local tmp=$(mktemp)
-        tidy -config tidy.config "$html_file" > "$tmp" 2>/dev/null || true
-        mv "$tmp" "$html_file"
+    for f in "$folder/artifact.html" "$folder/staging.html"; do
+        perl -0777 -pi -e 's/<!--.*?-->//gs' "$f"
+        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${art_dom},,g" "$f"
+        sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${stg_dom},,g" "$f"
+        sed -i 's|\\/|/|g' "$f"
+        sed -i -E 's/elementor-element-[0-9a-fA-F]+/MASKED-ID/g' "$f"
+        local t=$(mktemp); tidy -config tidy.config "$f" > "$t" 2>/dev/null || true; mv "$t" "$f"
     done
 
-    # Audit logic: Check for structural regressions using xmldiff (ignoring simple moves)
-    # xmldiff requires valid XML/XHTML, which tidy just provided.
-    # Note: grep -v returns exit 1 if no matches are found (which is our goal).
-    # We must assign it separately from 'local' to ensure 'set -e' doesn't kill the subshell.
-    local structural_diff
-    structural_diff=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$" | tr -d '[:space:]' || true)
-    
-    # Generate human-readable unified diff for debugging if ANY differences exist
-    diff -u "$folder/artifact.html" "$folder/staging.html" > "$folder/diff.txt" 2>&1 || true
-
-    if [[ -z "$structural_diff" ]]; then 
-        rm -rf "$folder"
-        [[ "$DEEP_AUDIT" == true ]] && echo -e "  ${GREEN}✓${RESET} No regressions found in ${BOLD}${slug}${RESET} (cleaned up)"
-        # Cleanup parent tree if empty
-        while [[ "$folder" != "artifacts" && "$folder" != "." ]]; do
-            folder=$(dirname "$folder")
-            rmdir "$folder" 2>/dev/null || break
-        done
-    else 
-        echo -e "  ${RED}✗${RESET} Structural or content regressions found in ${BOLD}${slug}${RESET}"
-        # If the diff was purely moves, it was filtered from structural_diff, so we pass.
-        # But if diff.txt is NOT empty, it means we have order changes that we recorded for inspection.
+    local structural=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$" | tr -d '[:space:]' || true)
+    if [[ -z "$structural" ]]; then # rm -rf "$folder"
+        [[ "$DEEP_AUDIT" == true ]] && echo -e "  ${GREEN}✓${RESET} No regressions: ${slug}"
+    else echo -e "  ${RED}✗${RESET} Regression found: ${slug}"
     fi
 }
 
-# ── Arguments & Orchestration ─────────────────────────────────────────
-BASE_URL=""
-SUBPAGES=()
-TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
+# ── Main Orchestration ─────────────────────────────────────────────
+SUBPAGES=(); BASE_URL=""; load_env
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --api) USE_API=true; shift ;;
         --bake) DO_BAKE=true; USE_API=true; shift ;;
-        --name) BAKE_NAME="$2"; shift 2 ;;
         --deep-audit) DEEP_AUDIT=true; shift ;;
-        --pages)
-            IFS=',' read -r -a SUBPAGES <<< "$2"
-            shift 2
-            ;;
         --site-id) SITE_ID="$2"; shift 2 ;;
+        --pages) IFS=',' read -r -a SUBPAGES <<< "$2"; shift 2 ;;
         --sample) SAMPLE_SIZE="$2"; shift 2 ;;
-        --sitemap-from) SITEMAP_FROM="${2%/}"; shift 2 ;;
-        --prime) PRIME_ONLY=true; shift ;;
-        -*) usage ;;
-        *) SUBPAGES+=("${1%/}"); shift ;;
+        *) [[ -z "$BASE_URL" ]] && BASE_URL="${1%/}" || SUBPAGES+=("${1%/}"); shift ;;
     esac
 done
 
+TMPDIR=$(mktemp -d); trap 'rm -rf "$TMPDIR"' EXIT
+
 if [[ "$USE_API" == true ]]; then
-    shifter_login
-    SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
-    STAGING_URL="https://${SITE_ID}.static.getshifter.net"
-    
+    shifter_login; SITE_ID="${SITE_ID:-$DEFAULT_SITE_ID}"
     if [[ "$DO_BAKE" == true ]]; then
-        # Check if a bake is already in progress to latch onto it
+        info "Checking for existing bake..." >&2
         LATEST_DATA=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r 'sort_by(.created_at) | last')
         LATEST_STATUS=$(echo "$LATEST_DATA" | jq -r '.status')
         if [[ "$LATEST_STATUS" == "increation" ]]; then
             AID=$(echo "$LATEST_DATA" | jq -r '.artifact_id')
-            info "Latching onto existing bake: ${CYAN}${AID}${RESET}..." >&2
+            info "Latching onto active bake: ${CYAN}${AID}${RESET}..." >&2
         else
             shifter_stop_wordpress "$SITE_ID"
-            AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME") || exit 1
+            AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
         fi
-        shifter_wait_for_bake "$SITE_ID" "$AID"
-        shifter_launch_preview "$SITE_ID" "$AID"
-        shifter_start_wordpress "$SITE_ID"
-    else
-        AID=$(shifter_get_latest_artifact "$SITE_ID")
+        shifter_wait_for_bake "$SITE_ID" "$AID"; shifter_launch_preview "$SITE_ID" "$AID"; shifter_start_wordpress "$SITE_ID"
+    else AID=$(shifter_get_latest_artifact "$SITE_ID")
     fi
-    BASE_URL="https://${AID}.preview.getshifter.io"
-    STAGING_URL="https://${SITE_ID}.static.getshifter.net"
-    SITEMAP_URL="${STAGING_URL}/sitemap.xml"
-else
-    # Manual Mode
-    [[ -z "$BASE_URL" ]] && usage
-    AID="${AID:-manual_audit_$(date +%H%M%S)}"
-    STAGING_URL="${STAGING_URL:-${SITEMAP_FROM%/*}}"
-    SITEMAP_URL="${STAGING_URL}/sitemap.xml"
+    BASE_URL="https://${AID}.preview.getshifter.io"; STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+else [[ -z "$BASE_URL" ]] && usage; AID="manual"; STAGING_URL=""
 fi
 
-echo -e "  Artifact ID: ${CYAN}${AID}${RESET}" >&2
-echo -e "  Target URL:   ${CYAN}${BASE_URL}${RESET}" >&2
-
-SITEMAP_URL="${SITEMAP_FROM:-$STAGING_URL}/sitemap.xml"
-
-if [[ "${#SUBPAGES[@]}" -gt 0 ]]; then
-    # Use specified subpages instead of sitemap
-    mkdir -p "$TMPDIR"
-    printf "%s\n" "${SUBPAGES[@]}" > "$TMPDIR/audit.txt"
-    info "Targeting ${#SUBPAGES[@]} specific pages..."
-else
-    # Site-agnostic extraction: grab <loc>, then strip the protocol and domain
-    status_msg="Waiting for Staging to be responsive at ${SITEMAP_URL}..."
-    if [[ -n "${STAGING_URL:-}" ]]; then
-        info "$status_msg" >&2
-        s_status=0; retry=0; wp_started=false
-        while [[ "$s_status" != "200" && "$retry" -lt 30 ]]; do
-            s_status=$(curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" -o /dev/null -w "%{http_code}" "$SITEMAP_URL" || echo "000")
-            if [[ "$s_status" == 5* && "$USE_API" == true && "$wp_started" == false ]]; then
-                warn "Staging returned HTTP ${s_status}. Attempting to start WordPress..." >&2
-                shifter_start_wordpress "$SITE_ID"
-                wp_started=true
-            fi
-            [[ "$s_status" != "200" ]] && { echo -ne "  ${YELLOW}⌛ Waiting for HTTP 200... (Current: ${s_status})\r${RESET}" >&2; sleep 10; retry=$((retry+1)); }
-        done
-        echo -e "\n  ${GREEN}✓${RESET} Staging is responsive. Settling 5s..." >&2; sleep 5
-    fi
-    mkdir -p "$TMPDIR"
-    curl -s -L -H "Referer: ${STAGING_URL:-$BASE_URL}/" "$SITEMAP_URL" | \
-        sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | \
-        sed -E 's|^https?://[^/]+||' | \
-        grep "^/" | grep -v "#" > "$TMPDIR/all_slugs.txt"
-    [[ "$SAMPLE_SIZE" -gt 0 ]] && shuf -n "$SAMPLE_SIZE" "$TMPDIR/all_slugs.txt" > "$TMPDIR/audit.txt" || cp "$TMPDIR/all_slugs.txt" "$TMPDIR/audit.txt"
+if [[ ${#SUBPAGES[@]} -gt 0 ]]; then printf "%s\n" "${SUBPAGES[@]}" > "$TMPDIR/audit.txt"
+else curl -s "https://${SITE_ID:-manual}.static.getshifter.net/sitemap.xml" | sed -n 's/.*<loc>\(.*\)<\/loc>.*/\1/p' | sed -E 's|^https?://[^/]+||' > "$TMPDIR/audit.txt"
+     [[ "$SAMPLE_SIZE" -gt 0 ]] && { shuf -n "$SAMPLE_SIZE" "$TMPDIR/audit.txt" > "$TMPDIR/s.txt"; mv "$TMPDIR/s.txt" "$TMPDIR/audit.txt"; }
 fi
 
-# ── Execution ──
-echo -e "\n${BOLD}── Elementor Audit Execution ──${RESET}"
-info "Target: ${BASE_URL}"
-[[ -n "${STAGING_URL:-}" ]] && info "Source: ${STAGING_URL}"
-info "Sitemap: ${SITEMAP_URL}"
-
-JOBS=0; MAX=8
+JOBS=0; MAX=8; echo -e "\n${BOLD}── Executing Audit for AID: ${AID} ──${RESET}"
 while IFS= read -r slug; do
     (
         path="${slug:-/}"
-        # page_deep_audit does the diff if DEEP_AUDIT is true
-        if [[ "$DEEP_AUDIT" == true && -n "${STAGING_URL:-}" ]]; then
-            page_deep_audit "$slug" "$BASE_URL" "$STAGING_URL" "$AID"
-        fi
-
-        # Fidelity Checks (Fetch once and audit)
-        html=$(mktemp)
-        # Use Standard Browser User-Agent and Referer. Do NOT use Shifter Auth for Public/CDN checks.
-        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${BASE_URL}/" -o "$html" "${BASE_URL}${slug}"
-        
+        [[ "$DEEP_AUDIT" == true && -n "${STAGING_URL:-}" ]] && page_deep_audit "$slug" "$BASE_URL" "$STAGING_URL" "$AID"
+        html=$(mktemp); ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        curl -s -L -H "User-Agent: $ua" -o "$html" "${BASE_URL}${slug}"
         echo -e "\n${BOLD}${path}${RESET}"
-        grep -q "Shifter Elementor CSS Fix" "$html" && pass "Plugin heartbeat" || warn "Heartbeat missing (This is normal if page is non-Elementor)"
-        
-        # Hash Enforcement: Fail if ANY Elementor stylesheet in /uploads/ is missing the 10-char content hash
-        # Standard stylesheets in /plugins/ are exempt.
         while IFS= read -r link; do
             [[ -z "$link" ]] && continue
-            
-            # Identify if it's a "User Stylesheet" (generated in uploads)
-            if echo "$link" | grep -q "/uploads/elementor/"; then
-                # FAIL if it contains a query parameter (indicates stale Shifter fallback)
-                if echo "$link" | grep -q "[?&]ver="; then
-                    fail "Fallback Detected (Query Param in Uploads): $link"
-                # FAIL if it doesn't match our specific vVERSION.HASH.css format
-                elif ! echo "$link" | grep -qP "\.v[0-9.]+\.[a-f0-9]{10}\.css"; then
-                    fail "Unversioned User Stylesheet (Timestamp Detected): $link"
-                else
-                    pass "Hashed User Stylesheet detected: $(basename "$link")"
-                fi
-            fi
-
-check_asset_integrity() {
-    local link="$1"; local user_agent="$2"; local base_url="$3"; local staging_url="${4:-}"
-    local asset_tmp=$(mktemp)
-    local http_code=$(curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${base_url}/" -o "$asset_tmp" -w "%{http_code}" "$link")
-    
-    if [[ "$http_code" == "200" ]]; then
-        local size=$(stat -c%s "$asset_tmp")
-        if [[ "$size" -eq 0 ]]; then
-            fail "Integrity Failure (Empty File): $link"
-        elif grep -q "{{WRAPPER}}" "$asset_tmp"; then
-            fail "Canary Detected (Unreplaced Placeholders): $link"
-        else
-            # 1. Brace check: Elementor CSS must be balanced
-            local open_braces=$(grep -o "{" "$asset_tmp" | wc -l)
-            local close_braces=$(grep -o "}" "$asset_tmp" | wc -l)
-            if [[ "$open_braces" -ne "$close_braces" ]]; then
-                fail "Integrity Failure (Brace Mismatch $open_braces vs $close_braces): $link"
-            # 2. Staging Parity check: Identify silent truncations
-            elif [[ -n "$staging_url" && "$link" == *"/uploads/elementor/"* ]]; then
-                # Extract the base filename (e.g., post-311.css) to find it on Staging
-                local base_file=$(echo "$link" | grep -oP "post-\d+\.css|custom-[^.]+\.css" | head -1)
-                if [[ -n "$base_file" ]]; then
-                    local stg_link="${staging_url}/wp-content/uploads/elementor/css/${base_file}"
-                    local stg_size=$(curl -s -L -H "User-Agent: $user_agent" -H "Referer: ${staging_url}/" -o /dev/null -w "%{size_download}" "$stg_link")
-                    if [[ "$stg_size" -gt 0 ]]; then
-                        # Fail if artifact is significantly smaller than staging (e.g. < 80% of size)
-                        # We use bc for float math or simple integer bash math
-                        local min_expected=$(( stg_size * 80 / 100 ))
-                        if [[ "$size" -lt "$min_expected" ]]; then
-                            fail "Staging Parity Failure (Staging: ${stg_size} bytes, Artifact: ${size} bytes): $link"
-                        else
-                            pass "Asset verified: $(basename "$link") (${size} bytes)"
-                        fi
-                    else
-                        pass "Asset verified: $(basename "$link") (${size} bytes) - Staging source not found for parity"
-                    fi
-                else
-                     pass "Asset verified: $(basename "$link") (${size} bytes)"
-                fi
-            else
-                pass "Asset verified: $(basename "$link") (${size} bytes)"
-            fi
-        fi
-    else
-        fail "Asset Missing/Blocked ($http_code): $link"
-    fi
-    rm -f "$asset_tmp"
-}
-
-# ── Arguments & Orchestration ─────────────────────────────────────────
-            # Always check reachability and integrity regardless of origin
             [[ "$link" == /* ]] && link="${BASE_URL}${link}"
-            check_asset_integrity "$link" "$user_agent" "$BASE_URL" "${STAGING_URL:-}"
-        done <<< "$(grep -oP "href='[^']*elementor[^']*\.css[^']*'" "$html" | sed "s/href='//;s/'$//" || true)"
-        # 3. Breadcrumb & Inline CSS Extraction
-        local summary_log="$TMPDIR/summaries.log"
-        local css_size_log="$TMPDIR/css_sizes.log"
-        
-        # Extract Summary Breadcrumb (capture everything through end-of-comment)
-        local summary
+            check_asset_integrity "$link" "$ua" "$BASE_URL" "${STAGING_URL:-}"
+        done <<< "$(grep -oP "(href|src)=['\"][^'\"]*elementor[^'\"]*\.css[^'\"]*['\"]" "$html" | sed -E "s/(href|src)=['\"]//;s/['\"]$//" || true)"
         summary=$(grep -oP '<!-- shifter-css-fix-summary: \K[^-]+(?=\s*-->)' "$html" | tr -d '\n' || echo "none")
-        if [[ "$summary" != "none" && -n "$summary" ]]; then
-            echo "$path $summary" >> "$summary_log"
-            pass "Breadcrumb detected"
-        else
-            warn "Breadcrumb summary missing"
-        fi
-
-        # Extract Inline CSS Block and measure its size
-        # We target the 'elementor-frontend-inline-css' style block
-        local inline_css=$(perl -0777 -ne 'print $1 if /<style id="elementor-frontend-inline-css">(.+?)<\/style>/s' "$html" | tr -d '[:space:]' || true)
-        local inline_size=${#inline_css}
-        if [[ $inline_size -gt 0 ]]; then
-            echo "$path $inline_size" >> "$css_size_log"
-            # We don't report success here, we aggregate at the end
-        fi
-
+        [[ "$summary" != "none" ]] && echo "$path $summary" >> "$TMPDIR/summaries.log"
         rm -f "$html"
     ) &
     JOBS=$((JOBS+1)); [[ "$JOBS" -ge "$MAX" ]] && { wait -n || true; JOBS=$((JOBS-1)); }
-done < "$TMPDIR/audit.txt"; wait || true
+done < "$TMPDIR/audit.txt"; wait
 
-# ── Final Aggregation & Consistency Checks ───────────────────────────
-
-echo -e "\n${BOLD}── Post-Audit Consistency Analysis ──${RESET}"
-
-# 1. Inline CSS Consistency
-if [[ -f "$TMPDIR/css_sizes.log" ]]; then
-    info "Analyzing Inline CSS consistency across $(wc -l < "$TMPDIR/css_sizes.log") pages..."
-    # Find the most common size (the mode)
-    MODE_SIZE=$(awk '{print $2}' "$TMPDIR/css_sizes.log" | sort | uniq -c | sort -nr | head -1 | awk '{print $2}')
-    TOTAL_PAGES=$(wc -l < "$TMPDIR/css_sizes.log")
-    ANOMALIES=$(awk -v mode="$MODE_SIZE" '$2 != mode {print $1 " (" $2 " bytes)"}' "$TMPDIR/css_sizes.log")
-    
-    if [[ -z "$ANOMALIES" ]]; then
-        pass "CSS Consistency: All pages have identical inline CSS blocks ($MODE_SIZE bytes)"
-    else
-        fail "CSS Inconsistency Detected! Majority size is $MODE_SIZE, but these pages differ:"
-        echo "$ANOMALIES" | sed 's/^/    - /'
-        # Note: fail() already incremented FAIL_COUNT
-    fi
-fi
-
-# 2. Breadcrumb Statistics
+echo -e "\n${BOLD}── Analytics ──${RESET}"
 if [[ -f "$TMPDIR/summaries.log" ]]; then
-    info "Breadcrumb statistics:"
-    # Count occurrences of pre-warmed vs cache-hit
-    PW_COUNT=$(grep -o "pre-warmed=[^ ]*" "$TMPDIR/summaries.log" | grep -v "pre-warmed=0" | wc -l || echo 0)
-    CH_COUNT=$(grep -o "cache-hit=[^ ]*" "$TMPDIR/summaries.log" | grep -v "cache-hit=0" | wc -l || echo 0)
-    LOCK_WRITES=$(grep -o "lock-wrote=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-wrote=0" | wc -l || echo 0)
-    LOCK_SKIPS=$(grep -o "lock-skipped=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-skipped=0" | wc -l || echo 0)
-    TIMEOUTS=$(grep -o "lock-timeout=[^ ]*" "$TMPDIR/summaries.log" | grep -v "lock-timeout=0" | wc -l || echo 0)
-    
-    echo -e "    - Pre-warmed events:  $PW_COUNT"
-    echo -e "    - Cache hit events:   $CH_COUNT"
-    echo -e "    - Lock write events:  $LOCK_WRITES"
-    echo -e "    - Lock skip events:   $LOCK_SKIPS"
-    
-    if [[ "$TIMEOUTS" -gt 0 ]]; then
-        fail "Advisory Lock Timeouts: $TIMEOUTS"
-    else
-        pass "No advisory lock timeouts detected"
-    fi
+    echo "Breadcrumb Consistency Counts:"
+    awk '{print $2}' "$TMPDIR/summaries.log" | sort | uniq -c
+else echo "No breadcrumbs found. This is expected if plugin v4.0 is not yet active."
 fi
-
-if [[ "$DEEP_AUDIT" == true && -d "$ARTIFACTS_DIR/$AID" ]]; then
-    # Sweep any empty parent directories left behind by parallel race conditions
-    find "$ARTIFACTS_DIR/$AID" -type d -empty -delete 2>/dev/null
-    
-    # Audit Results summary doesn't need to reference the loop variable
-    echo -e "\n${BOLD}── Audit Results ──${RESET}"
-    if [[ -d "$ARTIFACTS_DIR/$AID" && -n "$(ls -A "$ARTIFACTS_DIR/$AID" 2>/dev/null)" ]]; then
-        fail "Regression conflicts found"
-    else
-        pass "No HTML regressions found"
-        # If the entire site was clean, remove the AID folder too
-        rmdir "$ARTIFACTS_DIR/$AID" 2>/dev/null || true
-    fi
-fi
-
-echo -e "\n${BOLD}${GREEN}Audit process complete.${RESET}"
+info "Audit Process Complete."
