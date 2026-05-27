@@ -216,12 +216,13 @@ function shifter_css_filename_versioning($src, $handle) {
             clearstatcache(true, $local_path);
             if (file_exists($local_path) && filesize($local_path) > 0) {
                 $content = @file_get_contents($local_path);
-                if ($content) {
+                if ($content !== false) {
                     // Integrity Check: Balanced Braces + No Placeholders
+                    // Elementor 4 may output files with 0 braces (e.g. comment-only).
                     $braces_open = substr_count($content, '{');
                     $braces_close = substr_count($content, '}');
                     
-                    if ($braces_open > 0 && $braces_open === $braces_close && strpos($content, '{{WRAPPER}}') === false) {
+                    if ($braces_open === $braces_close && strpos($content, '{{WRAPPER}}') === false) {
                         $stable_files[$local_path] = true;
                         break;
                     }
@@ -276,8 +277,9 @@ function shifter_css_filename_versioning($src, $handle) {
         // Attempt to create the file exclusively
         $handle = @fopen($new_local_path, 'x');
         if ($handle) {
-            // We are the winner! Perform the copy.
-            if (@copy($local_path, $new_local_path)) {
+            // We are the winner! Read and write directly to the open stream.
+            $content = @file_get_contents($local_path);
+            if ($content !== false && @fwrite($handle, $content)) {
                 @fclose($handle);
             } else {
                 @fclose($handle);
