@@ -150,6 +150,8 @@ function shifter_lock_elementor_css_update($check, $object_id, $meta_key, $meta_
         if ($obj_id == $object_id && $key === '_elementor_css') {
             global $wpdb;
             $wpdb->get_var($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
+            // Invalidate the hash registry so next render re-hashes with new content
+            delete_option('shifter_css_hashes');
             remove_action('updated_postmeta', $release_callback);
             remove_action('added_post_meta', $release_callback);
         }
@@ -199,6 +201,44 @@ function shifter_css_filename_versioning($src, $handle) {
     $rel_path = substr($path, $pos + strlen($upload_token));
     // Strip query strings and fragments from the physical path
     $rel_path = preg_replace('/(\?|#).*$/', '', $rel_path);
+
+    /**
+     * MASTER REGISTRY: Check the database-backed hash registry before any S3 I/O.
+     * get_option is autoloaded and served from Redis (~0ms). This eliminates
+     * all file_exists/file_get_contents/md5_file S3 round-trips on cache hits.
+     */
+    static $registry = null;
+    static $registry_dirty = false;
+    static $shutdown_registered = false;
+
+    if ($registry === null) {
+        $registry = get_option('shifter_css_hashes', []);
+        if (!is_array($registry)) $registry = [];
+    }
+
+    // Registry key: rel_path + query string. If Elementor regenerates CSS,
+    // the ?ver= timestamp changes, creating a new key (auto-invalidation).
+    $registry_key = $rel_path . '|' . ($url['query'] ?? '');
+
+    if (isset($registry[$registry_key])) {
+        // Cache hit: return the hashed URL instantly, no S3 operations needed.
+        return preg_replace('/\.css(\?.*)?$/', $registry[$registry_key], $src);
+    }
+
+    // Register the deferred batch writer once per request
+    if (!$shutdown_registered) {
+        register_shutdown_function(function() use (&$registry, &$registry_dirty) {
+            if ($registry_dirty) {
+                update_option('shifter_css_hashes', $registry, true);
+            }
+        });
+        $shutdown_registered = true;
+    }
+
+    /**
+     * CACHE MISS: Fall through to the S3 pipeline (integrity check → hash → copy).
+     * This path runs once per CSS file, then the result is cached for all future requests.
+     */
     $local_path = $upload_base_path . '/' . ltrim($rel_path, '/');
 
     if (!file_exists($local_path)) {
@@ -301,9 +341,16 @@ function shifter_css_filename_versioning($src, $handle) {
     }
 
     /**
+     * Store in registry for future requests (deferred batch write at shutdown).
+     */
+    $url_suffix = $ver . '.' . $hash . '.css';
+    $registry[$registry_key] = $url_suffix;
+    $registry_dirty = true;
+
+    /**
      * Return the versioned URL. No fallback allowed.
      */
-    return preg_replace('/\.css(\?.*)?$/', $ver . '.' . $hash . '.css', $src);
+    return preg_replace('/\.css(\?.*)?$/', $url_suffix, $src);
 }
 
 
