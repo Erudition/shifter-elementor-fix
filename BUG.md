@@ -87,10 +87,11 @@ isn't under concurrency.
 
 ## Environment Notes
 
-- **Staging and Bake share the same infrastructure**: same MySQL database (cloned
-  at bake start), same S3 backend via the `s3-uploads` plugin, same filesystem
-  paths. There is no URL mismatch or environment difference that triggers the
-  re-render — the empty `status` field alone is sufficient.
+- **Staging and Bake share the same infrastructure**: same MySQL server (advisory
+  locks via `GET_LOCK` work across both environments), same S3 backend via the
+  `s3-uploads` plugin, same filesystem paths. There is no URL mismatch or
+  environment difference that triggers the re-render — the empty `status` field
+  alone is sufficient.
 - **`flock()` is unavailable**: The S3 stream wrapper silently ignores POSIX file
   locks. This is why our plugin's earlier `flock()`-based approach failed.
 - **`GET_LOCK()` is viable**: MySQL advisory locks (`GET_LOCK`/`RELEASE_LOCK`)

@@ -31,7 +31,8 @@ This document records the architectural pitfalls and solutions discovered while 
 ## 6. Concurrency & File Locking
 *   **The Issue**: Shifter generates pages in parallel. Multiple PHP processes may try to generate or copy the same shared CSS file at the exact same millisecond.
 *   **The Result**: Build-time deadlocks and "partially written" (corrupted) CSS files.
-*   **The Solution**: Implement `flock()` on sidecar `.lock` files. This ensures only one process writes the hashed file at a time, protecting file integrity and reducing 15+ minute build times down to seconds.
+*   **The First Attempt**: `flock()` on sidecar `.lock` files — **silently ignored** by Shifter's S3 stream wrapper (see Lesson 17).
+*   **The Solution**: Use `fopen(..., 'x')` (Exclusive Create) for atomic file creation on S3. This leverages the "Put-if-not-exists" protocol. Only the first worker to initiate the write succeeds; all others fail immediately and skip the redundant write. Combined with MySQL advisory locks for Elementor's CSS metadata (see BUG.md), this eliminated CSS corruption during parallel bakes.
 
 ## 7. The Performance Lab (Meta-Plugin) Conflict (Definitive)
 *   **The Issue**: The **Performance Lab (v4.1.0+)** meta-plugin performs a global optimization (likely its "Asset Manager" or a hidden pre-processing filter) that strips Elementor conditional assets (e.g., `shapes.min.css`) during both live renders and static bakes.
@@ -87,6 +88,7 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Pitfall**: If every worker performs its own `md5_file()` and `copy()` operation, the redundant S3 traffic and CPU load can crash the bake or trigger CloudFront rate limits.
 *   **The Solution**: Use the WordPress database (the `shifter_css_hashes` option) as a central registry.
 *   **The Logic**: The first worker to version a file saves the mapping to the database. All subsequent workers perform a lightweight `get_option()` check and return the hashed URL instantly without ever touching the S3 filesystem.
+*   **Scope Limitation**: The registry only caches the URL hashing/renaming pipeline (`style_loader_src`). It does NOT address latency from Elementor's own CSS *generation* pipeline (`enqueue() → update()`), nor from unrelated PHP warnings (see Lesson 22). If bake performance remains poor after registry implementation, investigate non-CSS bottlenecks.
 
 ## 19. The "Fallback" Masking Trap
 *   **The Issue**: If a plugin fails to version a file (e.g., due to a timeout) and "falls back" to the original unversioned URL, the page may appear to load correctly.
@@ -105,3 +107,16 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Lesson**: There is no native "template phase" on disk. If `{{WRAPPER}}` appears in an artifact, it is a sign of a failed memory-replacement loop or a process abortion.
 *   **The "Done" Metric**: The `Elementor\Stylesheet` rendering engine is deterministic; every selector block is wrapped in braces. Therefore, `count('{') === count('}')` is a high-fidelity test for a complete file, far superior to file size or age.
 *   **Query String Myths**: Elementor's native `?ver=` is tied to the file's modification timestamp, not the plugin code version. Our MD5 content-hashing is the most stable approach for CDN consistency.
+
+## 22. Orphaned Taxonomy Terms & `get_term_link()` Warnings
+*   **The Issue**: WordPress's `get_term_link()` (taxonomy.php:4705 in WP 6.9.4) calls `get_taxonomy($term->taxonomy)`. If a taxonomy was once registered (e.g., by a plugin) and then deactivated or renamed, the terms remain in `wp_term_taxonomy` with the old slug, but `get_taxonomy()` returns `false`.
+*   **The Symptom**: `PHP Warning: Attempt to read property "query_var" on false`. On PHP 7.4 this was a silent Notice; on PHP 8.0+ it is a logged Warning.
+*   **The Bake Impact**: If hundreds of pages trigger this warning during Shifter's parallel bake, the serialized error log writes to the S3-backed filesystem can block PHP execution, causing the bake to stall. Shifter's error buffer truncates to 20 messages with `SHIFTER_WARNING: There were too many notices, warnings or errors at almost the same time`.
+*   **Diagnosis**: Use the Shifter API endpoint `GET /sites/{site_id}/wordpress_site/errors` to retrieve the last 50 container errors (within 3 days). This endpoint was documented in the Shifter API swagger but returns structured JSON with `timestamp`, `error_level`, and `message` fields.
+*   **The Fix**: Identify orphaned terms by querying `wp_term_taxonomy` for taxonomy slugs not in the registered taxonomy list. Clean up or reassign the orphaned terms.
+
+## 23. Bake Generator Progress API
+*   **The Issue**: The Shifter bake progress percentage reported by `check_generator_process` can be misleading.
+*   **Key Fields**: `sum_url` (total URLs), `created_url` (URLs generated), `step` (`generate_url` = crawl phase), `update_time` (last activity timestamp).
+*   **Interpretation**: If `update_time` stops advancing while `step` is still `generate_url`, the crawl workers are hung on specific pages — NOT in a deploy/packaging phase. The `percent` is `created_url / sum_url`, so a stall at e.g. 77% means exactly 77% of pages rendered successfully and the rest are timing out.
+*   **The Rule**: Always check `update_time` staleness, not just `percent`, to distinguish a slow bake from a hung one.

@@ -27,7 +27,7 @@ The fix I've been using is a small snippet that renames the files upon creation 
 
 However, it turns out that the Shifter generator starts fresh and generates every single page in parallel, so it ends up generating the same shared stylesheets hundreds of times with different names.
 
-Worse, Elementor's CSS generation process happens in a few phases, with placeholders in the first pass that get filled in with subsequent passes. If the generator were to get overloaded and time out, the resulting filesheets are left with these placeholders, leading to a worse result than using an outdated copy, and a ton of hard to track down bugs.
+If the generator were to get overloaded and time out, the resulting stylesheets can be truncated mid-write, leading to worse results than using an outdated copy, and a ton of hard-to-track-down bugs. (Note: Elementor's placeholder substitution, e.g. `{{WRAPPER}}`, happens entirely in-memory — there is no multi-phase disk write. A `{{WRAPPER}}` in a physical file is a sign of a process crash, not a normal intermediate state.)
 
 In my experience, when the site gets relatively large, these factors combine to a point where
 
@@ -53,11 +53,11 @@ I started by intercepting Elementor's stylesheet save and using its `?ver=` vers
 
 Not only that, but now you can preview older artifacts and they'll still have the styles that they did at the time!
 
-## Better: File locks - Artifacts generate 15x faster!
+## Better: File locks & Advisory Locks - No more CSS corruption!
 
-Because Shifter generates pages in parallel, multiple PHP processes may try to create/copy the same CSS file at the exact same millisecond. If that takes too long, whoever gets cutoff at the timeout gets a partial stylesheet... even if theres's hundreds of good copies of the exact same sheet available that met the deadline.
+Because Shifter generates pages in parallel, multiple PHP processes may try to create/copy the same CSS file at the exact same millisecond. Since `flock()` is silently ignored by Shifter's S3 stream wrapper, the plugin uses `fopen(..., 'x')` (Exclusive Create) for atomic file writes and MySQL `GET_LOCK()` advisory locks to serialize Elementor's CSS metadata writes.
 
-By blocking Shifter from doing this using locks, I finally saw my build times, which had been often exceeding 15 minutes, drop to under a minute... just like it used to be when the site was new!
+This eliminated the non-deterministic CSS corruption that caused broken pages on every other bake.
 
 ## Best: Content hash as the version string.
 
