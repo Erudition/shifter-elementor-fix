@@ -1,3 +1,9 @@
 .env
 artifacts/
 shifter-mu-plugins-snapshot/
+Shifter API/
+token.txt
+errors_res.json
+login_res.json
+
+sites_res.json
