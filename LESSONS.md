@@ -116,7 +116,22 @@ This document records the architectural pitfalls and solutions discovered while 
 *   **The Fix**: Identify orphaned terms by querying `wp_term_taxonomy` for taxonomy slugs not in the registered taxonomy list. Clean up or reassign the orphaned terms.
 
 ## 23. Bake Generator Progress API
-*   **The Issue**: The Shifter bake progress percentage reported by `check_generator_process` can be misleading.
+*   **The Issue**: The Shifter bake progress percentage reported by `check_generator_process` can be misleading. Percentage does not start climbing above 0% until the crawl step starts, and remains 100% after it finishes despite other steps before and after. The percentage often backtracks.
 *   **Key Fields**: `sum_url` (total URLs), `created_url` (URLs generated), `step` (`generate_url` = crawl phase), `update_time` (last activity timestamp).
 *   **Interpretation**: If `update_time` stops advancing while `step` is still `generate_url`, the crawl workers are hung on specific pages — NOT in a deploy/packaging phase. The `percent` is `created_url / sum_url`, so a stall at e.g. 77% means exactly 77% of pages rendered successfully and the rest are timing out.
 *   **The Rule**: Always check `update_time` staleness, not just `percent`, to distinguish a slow bake from a hung one.
+
+## 24. URL Volume as the Primary Bake Bottleneck
+*   **The Issue**: Bakes consistently stalled at 414/540 URLs (77%). Every individual URL rendered successfully in sequential testing (all 200, none >10s). The stall was purely from PHP-FPM worker exhaustion under parallel load.
+*   **The Root Cause**: Shifter's Artifact Helper (`ShifterUrlsBase`) enumerated **531 URLs**, of which **275 (52%) were taxonomy term feed URLs** (55 terms × 5 feed types: rdf, rss, rss2, atom, comments_rss2). With 50 parallel crawler workers competing for ~8 PHP-FPM slots, each page taking 3-8 seconds, requests queued beyond the per-request timeout.
+*   **The Fix**: Reduced URL count from 531 → 177 by enabling "skip feeds" and "skip tag archives" in the Shifter Generator settings, and adding `testimonial`, `comments`, and `/category/uncategorized/` to the exclude list. The bake then completed 177/177 URLs with zero stalls.
+*   **The Rule**: When a bake stalls at a consistent percentage, the first diagnostic should be the total URL count and composition — not individual page performance. Use the Shifter REST API (`GET /wp-json/shifter/v1/urls`) to enumerate all pages and check for URL types that can be skipped.
+
+## 25. Shifter Artifact Helper URL Enumeration Architecture
+*   **URL Sources**: The Artifact Helper generates URLs from six sources: `home`, `feed` (5 main site feeds), `permalink` (all published posts/pages/CPTs), `post_type_archive_link` (CPT archive pages + pagination), `term_link` (taxonomy term archives + per-term feeds + pagination), `archive_link` (date archives), `author_link`, and `redirection` (redirect rules).
+*   **Skip Controls**: The admin panel exposes per-type skip checkboxes (`shifter_skip_yearly`, `shifter_skip_monthly`, `shifter_skip_daily`, `shifter_skip_terms`, `shifter_skip_tag`, `shifter_skip_author`, `shifter_skip_feed`). These are checked via `_check_skip()` before URL generation.
+*   **Exclude Filter**: The `shifter_exclude_urls` option stores newline-separated patterns. Each pattern is matched via `strpos($link, $pattern)` — a **substring match**, not a prefix or regex. Patterns starting with `.` are matched as file extension suffixes.
+*   **Custom URLs**: The `shifter_custom_urls` option appends additional URLs via the `ShifterURLS::AppendURLtoAll` filter. These are added after all other URL generation.
+*   **Taxonomy Term Feeds**: Each non-empty, non-skipped taxonomy term generates 1 archive URL + up to 5 feed URLs + pagination. This is the primary source of URL bloat on taxonomy-heavy sites.
+*   **Duplicate Term Links**: Taxonomies shared across post types (e.g., `category` registered for both `post` and `course`) generate duplicate `term_link` entries — one per post type iteration. These are identical URLs but count separately in the crawl queue.
+*   **Query Parameters**: Static artifacts store pages as `path/index.html` folders. Query-parameterized URLs (e.g., `?show_retired=1`) resolve to the same folder as the base path, so the last-crawled version wins. Use query params only for crawler URL discovery, not for content variation.
