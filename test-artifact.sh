@@ -4,7 +4,6 @@
 #
 set -euo pipefail
 
-curl() { command curl --doh-url https://1.1.1.1/dns-query "$@"; }
 
 # ── Dependencies ──────────────────────────────────────────────────────
 check_dependencies() {
