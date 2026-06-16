@@ -4,6 +4,24 @@
 #
 set -euo pipefail
 
+curl() { command curl --doh-url https://1.1.1.1/dns-query "$@"; }
+
+# ── Dependencies ──────────────────────────────────────────────────────
+check_dependencies() {
+    local missing=()
+    for cmd in jq curl xmldiff base64 perl tidy; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "\033[0;31mError: Missing required dependencies: ${missing[*]}\033[0m" >&2
+        echo "Please run inside the guix shell as documented in TESTING.md." >&2
+        exit 1
+    fi
+}
+check_dependencies
+
 # ── Colors ───────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -171,8 +189,8 @@ page_deep_audit() {
     [[ "$slug" != */ ]] && slug="${slug}/"
     local folder="$ARTIFACTS_DIR/$aid$slug"; mkdir -p "$folder"
     local ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    curl -s -L -f -o "$folder/artifact.html" "${art_base}${slug}" || return
-    curl -s -L -f -o "$folder/staging.html" "${stg_base}${slug}" || return
+    curl -s -L -f -o "$folder/artifact.html" "${art_base}${slug}" || { echo -e "  ${YELLOW}⚠${RESET} Failed to fetch ${art_base}${slug}"; return 0; }
+    curl -s -L -f -o "$folder/staging.html" "${stg_base}${slug}" || { echo -e "  ${YELLOW}⚠${RESET} Failed to fetch ${stg_base}${slug}"; return 0; }
     
     local art_dom=$(echo "$art_base" | sed -E 's|^https?://([^/]+).*|\1|')
     local stg_dom=$(echo "$stg_base" | sed -E 's|^https?://([^/]+).*|\1|')
@@ -183,13 +201,26 @@ page_deep_audit() {
         sed -i -E "s,(https?|webcal|//)?[:\\\\/%2F]+${stg_dom},,g" "$f"
         sed -i 's|\\/|/|g' "$f"
         sed -i -E 's/elementor-element-[0-9a-fA-F]+/MASKED-ID/g' "$f"
-        local t=$(mktemp); tidy -config tidy.config "$f" > "$t" 2>/dev/null || true; mv "$t" "$f"
+        local t=$(mktemp); tidy -config tidy.config "$f" > "$t" 2>/dev/null || true
+        if [[ ! -s "$t" ]]; then
+            echo -e "  ${RED}✗${RESET} Deep Audit failed: tidy produced empty output for $f"
+            rm -f "$t"
+            return 1
+        fi
+        mv "$t" "$f"
     done
 
-    local structural=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>/dev/null | grep -E -v "\[move|^$" | tr -d '[:space:]' || true)
+    local diff_output
+    if ! diff_output=$(xmldiff "$folder/artifact.html" "$folder/staging.html" 2>&1); then
+        echo -e "  ${RED}✗${RESET} Deep Audit failed: xmldiff error on ${slug}"
+        return 1
+    fi
+    local structural=$(echo "$diff_output" | grep -E -v "\[move|^$" | tr -d '[:space:]' || true)
     if [[ -z "$structural" ]]; then # rm -rf "$folder"
         [[ "$DEEP_AUDIT" == true ]] && echo -e "  ${GREEN}✓${RESET} No regressions: ${slug}"
-    else echo -e "  ${RED}✗${RESET} Regression found: ${slug}"
+    else 
+        echo -e "  ${RED}✗${RESET} Regression found: ${slug}"
+        echo "$structural" | head -n 5 | sed 's/^/    /'
     fi
 }
 
@@ -223,9 +254,25 @@ if [[ "$USE_API" == true ]]; then
             AID=$(shifter_start_bake "$SITE_ID" "$BAKE_NAME")
         fi
         shifter_wait_for_bake "$SITE_ID" "$AID"; shifter_launch_preview "$SITE_ID" "$AID"; shifter_start_wordpress "$SITE_ID"
-    else AID=$(shifter_get_latest_artifact "$SITE_ID")
+        BASE_URL="https://${AID}.preview.getshifter.io"
+    else
+        AID=$(shifter_get_latest_artifact "$SITE_ID")
+        LATEST_STATUS=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}/artifacts" -H "Authorization: ${ACCESS_TOKEN}" | jq -r ".[] | select(.artifact_id==\"$AID\") | .status")
+        if [[ "$LATEST_STATUS" == "published-shifter" || "$LATEST_STATUS" == "published" || "$LATEST_STATUS" == "deployed" ]]; then
+            DOMAIN=$(curl -s "https://api.getshifter.io/latest/sites/${SITE_ID}" -H "Authorization: ${ACCESS_TOKEN}" | jq -r '.domain')
+            if [[ -n "$DOMAIN" && "$DOMAIN" != "null" && "$DOMAIN" != "" ]]; then
+                BASE_URL="https://${DOMAIN}"
+            else
+                BASE_URL="https://${SITE_ID}.static.getshifter.net"
+            fi
+            info "Artifact is already live. Using ${BASE_URL} as preview." >&2
+        else
+            shifter_launch_preview "$SITE_ID" "$AID"
+            BASE_URL="https://${AID}.preview.getshifter.io"
+        fi
     fi
-    BASE_URL="https://${AID}.preview.getshifter.io"; STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+    STAGING_URL="https://${SITE_ID}.static.getshifter.net"
+    shifter_start_wordpress "$SITE_ID"
 else [[ -z "$BASE_URL" ]] && usage; AID="manual"; STAGING_URL=""
 fi
 
@@ -247,6 +294,20 @@ while IFS= read -r slug; do
             [[ "$link" == /* ]] && link="${BASE_URL}${link}"
             check_asset_integrity "$link" "$ua" "$BASE_URL" "${STAGING_URL:-}"
         done <<< "$(grep -oP "(href|src)=['\"][^'\"]*elementor[^'\"]*\.css[^'\"]*['\"]" "$html" | sed -E "s/(href|src)=['\"]//;s/['\"]$//" || true)"
+        
+        if [[ -n "${STAGING_URL:-}" ]]; then
+            stg_html=$(mktemp)
+            if curl -s -L -H "User-Agent: $ua" -o "$stg_html" "${STAGING_URL}${slug}"; then
+                art_css=$(grep -oP "(href|src)=['\"][^'\"]*\.css[^'\"]*['\"]" "$html" | sed -E "s/(href|src)=['\"]//;s/['\"]$//" | awk -F'/' '{print $NF}' | cut -d'?' -f1 | sort -u || true)
+                stg_css=$(grep -oP "(href|src)=['\"][^'\"]*\.css[^'\"]*['\"]" "$stg_html" | sed -E "s/(href|src)=['\"]//;s/['\"]$//" | awk -F'/' '{print $NF}' | cut -d'?' -f1 | sort -u || true)
+                for css in $stg_css; do
+                    if ! echo "$art_css" | grep -q "^${css}$"; then
+                        fail "Missing Stylesheet: $css is in staging but missing from artifact"
+                    fi
+                done
+            fi
+            rm -f "$stg_html"
+        fi
         summary=$(grep -oP '<!-- shifter-css-fix-summary: \K[^-]+(?=\s*-->)' "$html" | tr -d '\n' || echo "none")
         [[ "$summary" != "none" ]] && echo "$path $summary" >> "$TMPDIR/summaries.log"
         rm -f "$html"

@@ -353,5 +353,24 @@ function shifter_css_filename_versioning($src, $handle) {
     return preg_replace('/\.css(\?.*)?$/', $url_suffix, $src);
 }
 
+/**
+ * SECTION 4: FORCE LOAD SHAPES
+ * Shifter's crawler drops the e-shapes conditional stylesheet on certain archive 
+ * pages because of Elementor cache generation timing during the bake.
+ * Forcing it globally fixes visually broken buttons and shape dividers on the live Artifact.
+ */
+add_action('elementor/frontend/after_enqueue_styles', function() {
+    wp_enqueue_style('e-shapes');
+});
 
 
+/**
+ * Hook into Elementor's "Regenerate Files & Data" tool.
+ * When the user clears Elementor's cache, we must also clear our CSS Hash registry.
+ */
+add_action( 'elementor/core/files/clear_cache', function() {
+    delete_option( 'shifter_css_hashes' );
+    
+    // Optional: Add a log or breadcrumb so we know it happened
+    error_log( 'Shifter Elementor Fix: Registry cleared via Elementor Clear Cache tool.' );
+} );
